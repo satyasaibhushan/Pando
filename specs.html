@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pando — Technical Specification</title>
+<meta name="description" content="Working technical specification for Pando: architecture decisions, sync protocol, conflict model, economics, and the phased build plan.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,300..700;1,6..72,300..700&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #f6f0e1;
+  --paper-2: #efe7d3;
+  --card: #fbf7ec;
+  --ink: #23291f;
+  --ink-soft: #565e4c;
+  --ink-faint: #8b917d;
+  --line: #d9cfb4;
+  --gold: #b07716;
+  --gold-bg: #f3e2bc;
+  --moss: #5d7a3d;
+  --moss-bg: #e2e8d2;
+  --rust: #a34a2a;
+  --night: #0e1411;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Newsreader", Georgia, serif;
+  font-size: 17px;
+  line-height: 1.68;
+}
+.mono { font-family:"JetBrains Mono", ui-monospace, monospace; }
+code {
+  font-family:"JetBrains Mono", monospace; font-size:.82em;
+  background: var(--paper-2); border:1px solid var(--line);
+  padding:1px 6px; border-radius:4px; white-space:nowrap;
+}
+a { color: var(--gold); }
+
+/* masthead */
+.masthead {
+  background: var(--night); color:#ece4d0;
+  padding: 46px 0 40px;
+}
+.masthead .inner { max-width: 1140px; margin:0 auto; padding:0 28px; display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:18px; }
+.masthead h1 { font-family:"Fraunces", serif; font-weight:520; font-size: clamp(30px,4.5vw,44px); font-variation-settings:"SOFT" 50; }
+.masthead h1 .dot { color:#e2a53c; }
+.masthead .doc-type { font-family:"JetBrains Mono", monospace; font-size:12px; letter-spacing:.3em; text-transform:uppercase; color:#86a468; margin-bottom:8px; }
+.masthead .meta { font-family:"JetBrains Mono", monospace; font-size:12px; color:#b8b09c; text-align:right; line-height:2; }
+.masthead .meta a { color:#e2a53c; text-decoration:none; }
+
+/* layout */
+.page { max-width:1140px; margin:0 auto; padding:52px 28px 110px; display:grid; grid-template-columns: 230px 1fr; gap:56px; }
+nav.toc { position:sticky; top:32px; align-self:start; font-size:14px; }
+nav.toc .toc-title { font-family:"JetBrains Mono", monospace; font-size:11px; letter-spacing:.28em; text-transform:uppercase; color:var(--ink-faint); margin-bottom:14px; }
+nav.toc a {
+  display:block; color:var(--ink-soft); text-decoration:none; padding:5px 0 5px 14px;
+  border-left:2px solid var(--line); transition: all .15s; line-height:1.4;
+}
+nav.toc a:hover { color:var(--gold); border-left-color:var(--gold); }
+nav.toc a .n { font-family:"JetBrains Mono", monospace; font-size:11px; color:var(--ink-faint); margin-right:6px; }
+
+main { min-width:0; }
+section { margin-bottom:74px; }
+h2 {
+  font-family:"Fraunces", serif; font-weight:540; font-size:31px; line-height:1.15;
+  font-variation-settings:"SOFT" 40; margin-bottom:8px;
+  padding-top:18px; border-top:3px solid var(--ink);
+}
+h2 .sn { font-family:"JetBrains Mono", monospace; font-size:14px; font-weight:500; color:var(--gold); display:block; margin-bottom:10px; letter-spacing:.2em; }
+h3 { font-family:"Fraunces", serif; font-weight:560; font-size:21px; margin:34px 0 10px; font-variation-settings:"SOFT" 40; }
+p { margin-bottom:14px; max-width:72ch; }
+p.dim, li.dim { color:var(--ink-soft); }
+ul, ol { margin:0 0 16px 24px; max-width:70ch; }
+li { margin-bottom:8px; }
+strong { font-weight:640; }
+em { font-style:italic; }
+
+.callout {
+  background:var(--card); border:1px solid var(--line); border-left:4px solid var(--gold);
+  border-radius:0 10px 10px 0; padding:18px 22px; margin:22px 0; max-width:76ch;
+}
+.callout.moss { border-left-color:var(--moss); }
+.callout.rust { border-left-color:var(--rust); }
+.callout .tag { font-family:"JetBrains Mono", monospace; font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--gold); display:block; margin-bottom:6px; }
+.callout.moss .tag { color:var(--moss); }
+.callout.rust .tag { color:var(--rust); }
+.callout p:last-child { margin-bottom:0; }
+
+/* decision blocks */
+.decision { border:1px solid var(--line); border-radius:12px; overflow:hidden; margin:26px 0; background:var(--card); }
+.decision .d-head { padding:16px 22px; border-bottom:1px solid var(--line); background:var(--paper-2); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+.decision .d-head .q { font-family:"Fraunces", serif; font-weight:580; font-size:19px; }
+.decision .d-head .id { font-family:"JetBrains Mono", monospace; font-size:11.5px; color:var(--gold); letter-spacing:.14em; }
+.option { display:flex; gap:14px; padding:13px 22px; border-bottom:1px solid var(--line); font-size:15.5px; }
+.option:last-of-type { border-bottom:none; }
+.option .glyph { font-family:"JetBrains Mono", monospace; flex:0 0 18px; }
+.option.rejected { color:var(--ink-faint); }
+.option.rejected .glyph { color:var(--rust); }
+.option.chosen { background:var(--moss-bg); }
+.option.chosen .glyph { color:var(--moss); font-weight:700; }
+.option b { font-weight:640; color:var(--ink); }
+.option.rejected b { color:var(--ink-soft); }
+.decision .verdict { padding:14px 22px; font-size:15px; background:var(--card); color:var(--ink-soft); border-top:1px dashed var(--line); }
+.decision .verdict b { color:var(--moss); font-family:"JetBrains Mono", monospace; font-size:12px; letter-spacing:.18em; text-transform:uppercase; margin-right:10px; }
+
+/* tables */
+.tablewrap { overflow-x:auto; margin:20px 0; border:1px solid var(--line); border-radius:10px; }
+table { border-collapse:collapse; width:100%; font-size:14.5px; background:var(--card); }
+th { font-family:"JetBrains Mono", monospace; font-size:11px; letter-spacing:.16em; text-transform:uppercase; text-align:left; color:var(--ink-soft); background:var(--paper-2); padding:11px 16px; border-bottom:1px solid var(--line); white-space:nowrap; }
+td { padding:11px 16px; border-bottom:1px solid var(--line); vertical-align:top; }
+tr:last-child td { border-bottom:none; }
+td.mono, .mono td { font-family:"JetBrains Mono", monospace; font-size:13px; }
+
+/* buckets */
+.bucket-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin:20px 0; }
+.bkt { border:1px solid var(--line); border-radius:10px; padding:16px 18px; background:var(--card); }
+.bkt .b-name { font-family:"JetBrains Mono", monospace; font-size:12px; letter-spacing:.18em; text-transform:uppercase; margin-bottom:8px; }
+.bkt p { font-size:14px; color:var(--ink-soft); margin:0; }
+.bkt.source .b-name { color:var(--moss); } .bkt.source { border-top:3px solid var(--moss); }
+.bkt.secret .b-name { color:var(--gold); } .bkt.secret { border-top:3px solid var(--gold); }
+.bkt.derived .b-name { color:#4a6a8a; } .bkt.derived { border-top:3px solid #4a6a8a; }
+.bkt.localonly .b-name { color:var(--ink-faint); } .bkt.localonly { border-top:3px solid var(--ink-faint); }
+
+/* roadmap */
+.phase { border:1px solid var(--line); border-radius:14px; background:var(--card); margin:26px 0; overflow:hidden; }
+.phase-head { padding:20px 24px 16px; background:var(--paper-2); border-bottom:1px solid var(--line); }
+.phase-head .p-title { display:flex; justify-content:space-between; align-items:baseline; gap:16px; flex-wrap:wrap; }
+.phase-head h3 { margin:0; font-size:22px; }
+.phase-head .goal { font-size:14.5px; color:var(--ink-soft); font-style:italic; margin-top:6px; }
+.p-count { font-family:"JetBrains Mono", monospace; font-size:12.5px; color:var(--ink-soft); }
+.p-bar { height:6px; background:var(--line); border-radius:99px; margin-top:12px; overflow:hidden; }
+.p-bar i { display:block; height:100%; width:0%; background:linear-gradient(90deg, var(--moss), #e2a53c); border-radius:99px; transition:width .4s ease; }
+.gate { padding:12px 24px; font-size:14px; background:var(--gold-bg); border-bottom:1px solid var(--line); }
+.gate b { font-family:"JetBrains Mono", monospace; font-size:11px; letter-spacing:.2em; text-transform:uppercase; color:var(--gold); margin-right:10px; }
+.tasks { list-style:none; margin:0; padding:6px 0; }
+.tasks li { margin:0; border-bottom:1px dashed var(--line); }
+.tasks li:last-child { border-bottom:none; }
+.tasks label { display:flex; gap:14px; padding:11px 24px; cursor:pointer; font-size:15.5px; align-items:flex-start; transition:background .15s; }
+.tasks label:hover { background:var(--paper-2); }
+.tasks input { margin-top:5px; accent-color:var(--moss); width:15px; height:15px; flex:0 0 15px; cursor:pointer; }
+.tasks input:checked + span { color:var(--ink-faint); text-decoration:line-through; text-decoration-color:var(--moss); text-decoration-thickness:1.5px; }
+.tasks .sub { font-family:"JetBrains Mono", monospace; font-size:11px; letter-spacing:.1em; color:var(--gold); text-transform:uppercase; margin-right:8px; }
+
+footer.doc-foot { border-top:3px solid var(--ink); margin-top:80px; padding-top:20px; font-family:"JetBrains Mono", monospace; font-size:12px; color:var(--ink-faint); display:flex; justify-content:space-between; flex-wrap:gap; gap:12px; }
+footer.doc-foot a { color:var(--gold); text-decoration:none; }
+
+@media (max-width: 900px) {
+  .page { grid-template-columns:1fr; gap:20px; }
+  nav.toc { position:static; display:flex; flex-wrap:wrap; gap:4px 14px; border-bottom:1px solid var(--line); padding-bottom:18px; }
+  nav.toc .toc-title { width:100%; }
+  nav.toc a { border-left:none; padding:2px 0; }
+}
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <div class="inner">
+    <div>
+      <div class="doc-type">Working specification · v0.1</div>
+      <h1>Pando<span class="dot">.</span> Technical Spec</h1>
+    </div>
+    <div class="meta">
+      status: <span style="color:#e2a53c">design settled, build not started</span><br>
+      drafted: july 2026 · owner: satyasaibhushan<br>
+      <a href="index.html">← the vision page</a>
+    </div>
+  </div>
+</div>
+
+<div class="page">
+<nav class="toc">
+  <div class="toc-title">Contents</div>
+  <a href="#scope"><span class="n">01</span>Scope</a>
+  <a href="#concepts"><span class="n">02</span>Core concepts</a>
+  <a href="#decisions"><span class="n">03</span>Architecture decisions</a>
+  <a href="#github"><span class="n">04</span>GitHub as base layer</a>
+  <a href="#classification"><span class="n">05</span>Classification &amp; rehydration</a>
+  <a href="#topology"><span class="n">06</span>Topology &amp; roles</a>
+  <a href="#security"><span class="n">07</span>Security model</a>
+  <a href="#economics"><span class="n">08</span>Storage &amp; economics</a>
+  <a href="#edges"><span class="n">09</span>Edge-case register</a>
+  <a href="#market"><span class="n">10</span>Prior art</a>
+  <a href="#risks"><span class="n">11</span>Risks</a>
+  <a href="#roadmap"><span class="n">12</span>Roadmap &amp; tasks</a>
+  <a href="#open"><span class="n">13</span>Open questions</a>
+</nav>
+
+<main>
+
+<section id="scope">
+  <h2><span class="sn">§01</span>Scope: the gap between keyboard and last push</h2>
+  <p><strong>Pando is a working-tree continuity fabric for one human (plus their agents) across many machines.</strong> Every machine renders the same working universe: dirty files, untracked files, unpushed branches, stashes, index state, secrets, and the recipes for derived state. Git remains untouched on top — Pando lives strictly <em>underneath</em> it.</p>
+  <p>Everything committed <em>and pushed</em> is explicitly out of scope: that is git's and GitHub's job, and Pando leans on it (§04). Pando's entire storage, sync, and trust surface is <strong>the delta between the keyboard and the last push</strong>.</p>
+  <div class="callout moss">
+    <span class="tag">Identity</span>
+    <p><strong>Git is history. Pando is presence.</strong> Pando moves state; git moves meaning. Any feature that would make Pando impersonate git (auto-pull, auto-merge of team code, commit rewriting) is out of scope by principle.</p>
+  </div>
+  <p class="dim">Non-goals: multi-user real-time collaboration (Google-Docs-for-code), replacing the PR workflow (Sturdy's fatal mistake), cloud-hosted development environments, general-purpose file sync.</p>
+</section>
+
+<section id="concepts">
+  <h2><span class="sn">§02</span>Core concepts</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td class="mono">fabric</td><td>The whole system: daemons + authority + stores. The root system of the grove.</td></tr>
+    <tr><td class="mono">trunk</td><td>A machine enrolled in the fabric. Renders the working universe locally; holds a device key.</td></tr>
+    <tr><td class="mono">snapshot</td><td>An immutable, content-addressed capture of a repo's full state at a quiescent moment. Taken every few idle seconds. Forms a DAG (growth rings).</td></tr>
+    <tr><td class="mono">overlay</td><td>The portion of a snapshot not derivable from GitHub: <code>snapshot = base commit SHA + overlay</code>. The only thing Pando stores durably.</td></tr>
+    <tr><td class="mono">authority</td><td>The always-on holder of latest state + lease table. Default: Pando cloud. Promotable to a user's own machine (§06).</td></tr>
+    <tr><td class="mono">lease</td><td>Per-repo write token. One trunk writes at a time; acquisition happens implicitly on sit-down. Prevents conflicts instead of resolving them.</td></tr>
+    <tr><td class="mono">fork</td><td>Deliberate divergence: editing while an offline trunk holds unsynced changes. Recorded as two DAG branches; reconciled by three-way merge.</td></tr>
+    <tr><td class="mono">recipe</td><td>The generator of derived state: lockfiles + platform triple + tool version. Synced instead of the artifacts it produces.</td></tr>
+    <tr><td class="mono">artifact CAS</td><td>Content-addressed store of built dependencies, keyed by (content hash, platform). Shared <em>across all users</em> for public packages.</td></tr>
+    <tr><td class="mono">exposure</td><td>Overlay size ≈ how much work exists only in Pando (unpushed). Surfaced in UI; pushing drains it to ~zero.</td></tr>
+  </table></div>
+</section>
+
+<section id="decisions">
+  <h2><span class="sn">§03</span>Architecture decisions</h2>
+  <p>Each decision lists the options weighed. <span class="mono" style="font-size:13px; color:var(--moss)">✓</span> marks the choice; rationale follows.</p>
+
+  <div class="decision">
+    <div class="d-head"><span class="id">D1 · TOPOLOGY</span><span class="q">How do bytes move between machines?</span></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Pure P2P mesh (Syncthing-style).</b> Requires two machines awake simultaneously — "close lid, open other laptop" breaks. That failure mode is the product failing.</div></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>Hub-and-spoke through an always-on authority.</b> Devices never need to co-exist in time. v1 ships this.</div></div>
+    <div class="option"><span class="glyph">→</span><div><b>Later: + opportunistic P2P</b> (LAN direct transfer, Tailscale-style) as a bandwidth optimization — never load-bearing.</div></div>
+    <div class="verdict"><b>Verdict</b>The always-on authority is what makes walking away safe. Everything else is optimization.</div>
+  </div>
+
+  <div class="decision">
+    <div class="d-head"><span class="id">D2 · DETECTION</span><span class="q">How are changes detected?</span></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Periodic scan only (rsync-style).</b> Lag between edit and capture is where data loss lives.</div></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>FS watchers (FSEvents / inotify) + chunked content-addressing,</b> with a periodic full scan as integrity backstop for missed events.</div></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Virtual filesystem (FUSE / File Provider / EdenFS-class).</b> Years of kernel-adjacent pain — and unnecessary: source trees are small enough to replicate fully (see D5 insight).</div></div>
+    <div class="verdict"><b>Verdict</b>Watcher + backstop scan. Dura and Mutagen prove the watcher discipline works in production.</div>
+  </div>
+
+  <div class="decision">
+    <div class="d-head"><span class="id">D3 · DATA MODEL</span><span class="q">What is "state"?</span></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Per-file versions (Dropbox model).</b> No whole-repo consistency; restores produce Frankenstein trees. Code files only make sense together.</div></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>Snapshot DAG: immutable content-addressed whole-tree captures</b> every few idle seconds — a shadow git one level below git. Divergence = branching, a solved mental model.</div></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>CRDTs / operation logs.</b> Solves two-humans-one-file, which is not this product. Silent semantic merges of code are worse than honest conflicts.</div></div>
+    <div class="verdict"><b>Verdict</b>Snapshot DAG. Reuses git's proven Merkle-tree storage model; gives time travel over uncommitted work for free.</div>
+  </div>
+
+  <div class="decision">
+    <div class="d-head"><span class="id">D4 · CONFLICTS</span><span class="q">Two machines changed the same repo while apart — now what?</span></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Last-writer-wins.</b> Silent data loss. Disqualified, full stop.</div></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Conflict copies</b> (<code>main (conflicted copy).ts</code>). Stray files poison builds, imports, tooling.</div></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>Leases as the normal path:</b> sit-down acquires the per-repo write lease; previous holder released on idle/lid-close. Conflicts are <em>prevented</em>, matching the physics of one human body.</div></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>Fork-and-merge as the escape hatch:</b> editing past an offline lease-holder knowingly forks the DAG. Auto-merge when non-overlapping (the common case); one explicit reconcile UI otherwise.</div></div>
+    <div class="verdict"><b>Verdict</b>Prevention first, merge second, silence never. Agents lease their own branches/worktrees and never contend with the keyboard.</div>
+  </div>
+
+  <div class="decision">
+    <div class="d-head"><span class="id">D5 · REPLICATION</span><span class="q">Full copies or virtual placeholders?</span></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>Full local replicas of source on every pinned machine.</b> Key insight: source minus derived state is tiny (MBs). Local-first survives planes and dead wifi.</div></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Files-on-demand placeholders.</b> Only needed if trees were huge; they aren't, because derived state never syncs. Avoids the D2 virtual-FS trap entirely.</div></div>
+    <div class="verdict"><b>Verdict</b>Replicate source fully; keep bulk (history, artifacts) in the CAS. Per-repo pinning per machine.</div>
+  </div>
+
+  <div class="decision">
+    <div class="d-head"><span class="id">D6 · GIT RELATIONSHIP</span><span class="q">What does Pando do with <code>.git</code> itself?</span></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>Sync <code>.git</code> as ordinary data — safe only under D4's lease.</b> Branches, stash, index, remote-tracking refs travel with you. (Syncthing's documented repo-corruption failure is exactly what the lease removes.)</div></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Replace or wrap git (jj-style).</b> Wrong fight: users' git workflow is sacred (§01 identity).</div></div>
+    <div class="verdict"><b>Verdict</b>Sync it under the lease; be git-<em>aware</em> only for divergence merges and the §04 policies. D4 and D6 interlock — neither is safe alone.</div>
+  </div>
+</section>
+
+<section id="github">
+  <h2><span class="sn">§04</span>GitHub as base layer</h2>
+  <p>Assumption: nearly every repo has a remote. Then everything pushed is already replicated and CDN-distributed — so Pando stores only <strong>overlays</strong>: <code>snapshot = base SHA + overlay</code>.</p>
+  <ul>
+    <li><strong>Storage &amp; trust collapse.</strong> Pando holds MBs per user, all E2E-encrypted deltas — never the codebase. Hydrating a new machine = <code>git clone</code> from GitHub's CDN + a tiny overlay from the authority.</li>
+    <li><strong>Overlay GC on push.</strong> When a push advances the base, the authority garbage-collects everything now reachable from a pushed ref. Pushing drains <em>exposure</em> toward zero — the system nudges safe behavior without forcing it.</li>
+    <li><strong>Unpushed branches</strong> are the overlay's reason to exist: commits/refs unreachable from any pushed ref ride along automatically; orphan histories degrade to full snapshots inside the overlay.</li>
+    <li><strong>Remote drift policy: auto-fetch always, auto-pull never.</strong> Fetch is non-mutating; continuous background fetch means machines share one view of origin and pulls are instant. Reconciling with the team's code remains a deliberate git action.</li>
+    <li><strong>Force-push rescue (must ship day one).</strong> A non-fast-forward ref move can make an overlay's base unreachable → eventually GC'd by GitHub. On detection, promote the endangered base objects into the overlay before they vanish; slim down after the user rebases.</li>
+    <li><strong>Escape hatch (durability story):</strong> optional slow-lane push of encrypted snapshot bundles to hidden refs (<code>refs/pando/…</code>) every ~10 min — recent working state recoverable from GitHub alone if Pando's service disappears.</li>
+    <li><strong>Graceful degradation:</strong> no-remote repos get full snapshots. GitHub is an optimization, not a dependency; GitLab/Bitbucket/bare remotes work identically.</li>
+  </ul>
+  <div class="callout"><span class="tag">Decision</span><p><strong>Own authority for live sync; GitHub for base layer + escape hatch.</strong> GitHub-as-sole-authority was rejected: push latency (seconds, not ms), API rate limits, secrets-in-repo spookiness, read-only upstream repos.</p></div>
+</section>
+
+<section id="classification">
+  <h2><span class="sn">§05</span>Classification &amp; rehydration</h2>
+  <p>Every path in a working tree falls into one of four buckets:</p>
+  <div class="bucket-grid">
+    <div class="bkt source"><div class="b-name">source</div><p>Your code. Syncs always, keystroke-fresh, full replicas everywhere.</p></div>
+    <div class="bkt secret"><div class="b-name">secrets</div><p><code>.env</code> &amp; friends. Sync always, E2E-encrypted, never touch GitHub.</p></div>
+    <div class="bkt derived"><div class="b-name">derived</div><p><code>node_modules</code>, venvs, <code>target/</code>. Never synced as bytes — the <em>recipe</em> syncs; artifacts rebuild per platform.</p></div>
+    <div class="bkt localonly"><div class="b-name">local-only</div><p>Sockets, <code>.DS_Store</code>, editor caches, logs. Ignored, never rehydrated.</p></div>
+  </div>
+  <h3>Why rehydrate instead of copy</h3>
+  <p>Derived dirs are outputs of a pure-ish function of <code>(lockfile, platform triple, runtime version)</code> — so memoize per platform rather than transport. venvs prove this is architecture, not optimization: they hardcode absolute paths and break even between identical machines.</p>
+  <ul>
+    <li><strong>Trigger:</strong> repo materializes or lockfile changes → run the recipe (<code>npm ci</code>, <code>uv sync</code>) in the background, ideally before the editor opens.</li>
+    <li><strong>Artifact CAS:</strong> pure-JS packages/wheels shared across platforms and <em>users</em> (public bytes aren't secrets); native modules keyed by platform triple. Installs become hardlinks + a few downloads — the pnpm-store trick, machine-spanning.</li>
+    <li><strong>Pre-warm tier (optional):</strong> an always-on builder (user's box or cloud) hydrates its platform variant the moment a lockfile changes elsewhere. Floor is hydrate-on-arrival from warm CAS (seconds); pre-warm upgrades that to zero. Repos' own CI caches (GitHub Actions) can serve as builders.</li>
+  </ul>
+  <h3>Ignore rules</h3>
+  <p>Layered like gitignore, but with taste: <strong>built-in defaults</strong> (ship knowing <code>node_modules</code>, <code>.venv</code>, <code>target</code>…) → <strong>global</strong> <code>~/.config/pando/ignore</code> → <strong>per-repo</strong> <code>.pandoignore</code>, which inherits <code>.gitignore</code> and expresses deltas only — notably <em>"gitignored but sync anyway"</em> (<code>.env</code>). 95% of users should never write a rule.</p>
+</section>
+
+<section id="topology">
+  <h2><span class="sn">§06</span>Topology &amp; roles</h2>
+  <p>Three jobs exist; the fabric fills each with whatever the user has, defaulting to cloud. <strong>Roles, not machines.</strong></p>
+  <div class="tablewrap"><table>
+    <tr><th>Role</th><th>Job</th><th>Default (Tier 0)</th><th>Promotable to</th></tr>
+    <tr><td class="mono">authority</td><td>Always-on latest state + lease table; two machines never need to be awake together</td><td>Pando cloud (ciphertext only)</td><td>User's always-on box; cloud drops to thin relay</td></tr>
+    <tr><td class="mono">archive</td><td>Full snapshot history; laptops stay thin</td><td>Pando cloud object storage</td><td>Big-disk home machine</td></tr>
+    <tr><td class="mono">builder</td><td>Pre-warm derived state per platform</td><td>Cloud builders + global artifact CAS</td><td>User hardware / repo CI</td></tr>
+  </table></div>
+  <p class="dim">Tier 0 = cloud fills everything (the product must be great here — most users own one laptop). Tier 1 = user promotes a machine (<code>pando promote linuxbox --roles=authority,archive,builder</code>). Tier 2 = hybrid, roles filled independently. Pre-warming is always an optimization tier, never a requirement.</p>
+</section>
+
+<section id="security">
+  <h2><span class="sn">§07</span>Security model</h2>
+  <ul>
+    <li><strong>E2E by default; the authority stores ciphertext.</strong> Not a feature bullet — qualification to exist, and the moat platforms won't cross (they want to read working trees for AI context; Pando cryptographically can't).</li>
+    <li><strong>Keys:</strong> per-user master key → deterministic per-chunk keys (preserves within-account dedup). Device enrollment via existing-device approval (Tailscale/iMessage pattern). Compress before encrypt.</li>
+    <li><strong>Recovery:</strong> recovery phrase + N-device redundancy. Lose everything → overlays are gone, but blast radius is <em>unpushed work only</em>; the pushed base survives in plaintext on GitHub. Recovery UX gets first-class design attention — it's where E2E products die.</li>
+    <li><strong>Plaintext-by-design exceptions:</strong> the public artifact CAS (public npm/PyPI bytes; global dedup is the win) and control-plane metadata (machine names, lease timestamps, opaque chunk hashes — never content).</li>
+    <li><strong>Perf note:</strong> AES-GCM ≈ GB/s per core; payloads are KBs. Crypto ≈ microseconds against 20–100ms network RTTs. E2E's real costs are feature constraints (no server-side compute on content) and recovery UX — not milliseconds.</li>
+  </ul>
+</section>
+
+<section id="economics">
+  <h2><span class="sn">§08</span>Storage &amp; economics</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Store</th><th>Contents</th><th>Where</th><th>Why</th></tr>
+    <tr><td class="mono">overlay store</td><td>Encrypted content-addressed chunks</td><td>Zero-egress object storage (R2-class)</td><td>Sync products die by egress pricing; big hydration bandwidth is GitHub's anyway</td></tr>
+    <tr><td class="mono">control plane</td><td>DAG manifests, leases, devices, ref positions</td><td>Postgres</td><td>Lease acquisition = single-digit-ms row update</td></tr>
+    <tr><td class="mono">artifact CAS</td><td>Public package builds, platform-keyed</td><td>Object storage + CDN, unencrypted</td><td>Cross-user dedup; mostly cache hits</td></tr>
+    <tr><td class="mono">escape hatch</td><td>Encrypted snapshot bundles</td><td>GitHub hidden refs</td><td>Recoverable without Pando existing</td></tr>
+  </table></div>
+  <p><strong>Per-user cost:</strong> p50 ≈ 100–500 MB steady-state (≈ a penny/month at object-storage prices); p99 ≈ 5–20 GB (~$0.30/month) driven by force-push rescues, no-remote repos, media-in-git. Retention: seconds-granularity 7 days → hourly 30 days → daily beyond; quotas + nudges for pathological repos. Compare Dropbox's TBs-per-user against $10/month: the overlay model's unit economics are structurally better — a direct dividend of §04.</p>
+</section>
+
+<section id="edges">
+  <h2><span class="sn">§09</span>Edge-case register</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Case</th><th>Handling</th></tr>
+    <tr><td>Unpushed / orphan branches</td><td>Ride in overlay automatically; orphan histories become full snapshots inside it</td></tr>
+    <tr><td>Force-push / branch deletion upstream</td><td>Rescue endangered base objects into overlay before GitHub GC (§04); day-one feature</td></tr>
+    <tr><td>Offline edits on two machines</td><td>Deliberate fork → auto-merge if non-overlapping, else one reconcile UI (D4)</td></tr>
+    <tr><td>Lease-holder asleep in a bag, unsynced</td><td>Editing elsewhere = knowing fork; synced-then-slept holder = clean instant takeover</td></tr>
+    <tr><td>No-remote repo</td><td>Full snapshots instead of overlays; invisible to user</td></tr>
+    <tr><td>Repo where user lacks push rights</td><td>Base from upstream clone; overlay (and hidden-ref hatch, if enabled) targets user's fork</td></tr>
+    <tr><td>venv absolute paths</td><td>Never copied — always rebuilt (§05); the case that proves the architecture</td></tr>
+    <tr><td>Watcher missed events / crash mid-write</td><td>Periodic full-scan backstop (D2); snapshots only at quiescence</td></tr>
+    <tr><td>Huge binary assets tracked in git</td><td>They're "source" by definition → sync; quota nudges + per-repo snapshot-frequency downgrade</td></tr>
+    <tr><td>Agent + human same repo</td><td>Agents lease their own branch/worktree; never contend with the keyboard</td></tr>
+  </table></div>
+</section>
+
+<section id="market">
+  <h2><span class="sn">§10</span>Prior art — and the hole in the middle</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Attempt</th><th>Who</th><th>Why it isn't Pando</th><th>What we borrow</th></tr>
+    <tr><td>Generic file sync on repos</td><td>Syncthing, Dropbox</td><td>File-level merge corrupts <code>.git</code> under concurrency (maintainers say don't)</td><td>Their failure mode is our D4/D6 spec</td></tr>
+    <tr><td>Dev sync engines</td><td>Mutagen (→ Docker)</td><td>Local↔container sessions, not machine↔machine state</td><td>Watcher edge-case discipline</td></tr>
+    <tr><td>Local snapshot safety nets</td><td>dura, gitwatch, GitButler oplog</td><td>Single-machine only — the bottom half of Pando, no network</td><td>Shadow-snapshot mechanics, proven non-disruptive</td></tr>
+    <tr><td>Next-gen VCS</td><td>Jujutsu (jj)</td><td>Working-copy-as-commit, lock-free — auto-sync daemon wished for, never built</td><td>Concurrency design notes</td></tr>
+    <tr><td>Cloud dev environments</td><td>Codespaces, Coder, Gitpod→Ona, Daytona</td><td>Dissolve the problem by centralizing; incumbents pivoted to agent infra</td><td>Prebuilds = our pre-warm; devcontainer-as-recipe</td></tr>
+    <tr><td>Team-collab VCS layer</td><td>Sturdy (YC W21, dormant)</td><td>Fought the PR religion; team-first, not device-first</td><td>Positioning lesson: live <em>under</em> git, never against it</td></tr>
+    <tr><td>Big-tech internal</td><td>Google CitC, Meta EdenFS/Sapling</td><td>Proof at scale; never shipped externally</td><td>Confidence the model works</td></tr>
+  </table></div>
+  <p class="dim">The gap: local-first, multi-device, single-human working-state sync. Every prior attempt stayed single-machine, went cloud-centric, targeted teams, or wasn't code-aware. Timing: primitives commoditized, GitHub-as-base collapses costs, agents just created new demand for shared working trees.</p>
+</section>
+
+<section id="risks">
+  <h2><span class="sn">§11</span>Risks</h2>
+  <div class="callout rust"><span class="tag">Platform risk</span><p>GitHub/Microsoft <em>can</em> enter uncommitted territory any quarter (Codespaces already holds dirty trees; VS Code ships to everyone). The moat is what they <em>won't</em> do: E2E they can't read (starves Copilot context), vendor neutrality (GitLab/Bitbucket), local-first against their cloud gravity, and unglamorous cross-platform daemon grind. Lean on all four in design and positioning.</p></div>
+  <div class="callout rust"><span class="tag">Monetization risk</span><p>Individual devs feel this pain hardest and pay worst — exactly why CDE vendors fled to enterprise agent-infra. Likely commercial wedge: <strong>working-tree continuity for agent fleets</strong>. Personal-tool value is the hedge: worst case, infrastructure I use daily.</p></div>
+  <div class="callout rust"><span class="tag">Trust risk</span><p>A sync tool gets one chance: eat work once, lose the user forever. Mitigations: snapshots are append-only (nothing destructive by construction), simulation harness before real repos, dogfood soak time on the critical path, escape hatch independent of the service.</p></div>
+</section>
+
+<section id="roadmap">
+  <h2><span class="sn">§12</span>Roadmap &amp; task tracking</h2>
+  <p class="dim">Checkboxes persist in this browser (localStorage). Each phase ends in a gate — an explicit decision, not a vibe.</p>
+
+  <div class="phase" data-phase="p0">
+    <div class="phase-head">
+      <div class="p-title"><h3>Phase 0 — Prove the magic</h3><span class="p-count"></span></div>
+      <div class="goal">1–2 weekends · two machines, my repos, no encryption · deliverable is the <em>feeling</em>: close the MacBook mid-edit, open the linuxbox, it's all there.</div>
+      <div class="p-bar"><i></i></div>
+    </div>
+    <div class="gate"><b>Gate</b>If that moment doesn't hook me → stop; two weekends spent, answer bought. In parallel: run the two-week remote-dev control experiment (Tailscale + VS Code Remote into the linuxbox) — every frustration it produces is Pando's spec; none, and Pando may be unnecessary.</div>
+    <ul class="tasks">
+      <li><label><input type="checkbox" data-id="p0-1"><span><span class="sub">harness</span>Multi-machine simulation harness first: N fake trunks as processes, virtual clocks, adversarial interleavings (offline edits, lease steals, kill mid-sync)</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-2"><span><span class="sub">daemon</span>Watcher daemon (FSEvents + inotify): quiescence detection → shadow snapshot into git object store, dura-style, HEAD/index untouched</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-3"><span><span class="sub">daemon</span>Snapshot DAG + manifests: whole-tree capture incl. untracked + <code>.git</code> refs/stash/index; content-addressed chunks</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-4"><span><span class="sub">sync</span>Overlay computation against pushed refs; transport to a v0 authority (tiny service or the linuxbox)</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-5"><span><span class="sub">lease</span>Lease table + implicit acquire-on-activity, release-on-idle/lid-close; divergence = hard refuse (fork UX comes in P1)</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-6"><span><span class="sub">cli</span><code>pando status</code>: lease holder, exposure (unpushed bytes), last snapshot age, per-repo pin list</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-7"><span><span class="sub">e2e</span>The demo: dirty tree on MacBook → lid close → linuxbox renders it (files + branch + stash) within seconds</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-8"><span><span class="sub">control</span>Two-week remote-dev experiment log: every friction moment written down</span></label></li>
+    </ul>
+  </div>
+
+  <div class="phase" data-phase="p1">
+    <div class="phase-head">
+      <div class="p-title"><h3>Phase 1 — Daily driver I trust</h3><span class="p-count"></span></div>
+      <div class="goal">4–8 weeks part-time, dogfooding throughout · calendar dominated by <em>encountering</em> edge cases, not fixing them.</div>
+      <div class="p-bar"><i></i></div>
+    </div>
+    <div class="gate"><b>Gate</b>The retention test: after a month, can I tolerate going back to plain git-push discipline or remote-dev? Physically refusing to churn = strongest possible signal. Only then does Phase 2 exist.</div>
+    <ul class="tasks">
+      <li><label><input type="checkbox" data-id="p1-1"><span><span class="sub">conflict</span>Fork-and-merge: DAG branching on offline divergence, three-way auto-merge when non-overlapping, reconcile UI otherwise</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-2"><span><span class="sub">classify</span>Bucket engine + built-in defaults + <code>~/.config/pando/ignore</code> + <code>.pandoignore</code> (inherits .gitignore, deltas only)</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-3"><span><span class="sub">rehydrate</span>Recipe runner: lockfile change / repo materialize → <code>npm ci</code> / <code>uv sync</code> in background; per-platform artifact cache (local store first)</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-4"><span><span class="sub">secrets</span>E2E encryption of overlays: master key → per-chunk keys, compress-then-encrypt; <code>.env</code> travels, GitHub never sees it</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-5"><span><span class="sub">github</span>Auto-fetch daemon + shared remote-tracking view; overlay GC on push; exposure metric in status</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-6"><span><span class="sub">github</span>Force-push rescue: detect non-FF ref moves, promote endangered bases into overlay</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-7"><span><span class="sub">github</span>Escape hatch: encrypted snapshot bundles to <code>refs/pando/…</code> every ~10 min + standalone restore script</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-8"><span><span class="sub">integrity</span>Periodic full-scan backstop; append-only guarantees audited; restore-from-any-snapshot exercised weekly on real repos</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-9"><span><span class="sub">platform</span>macOS + Linux solid: sleep/wake, APFS case quirks, systemd/launchd packaging of the daemon</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-10"><span><span class="sub">dogfood</span>All personal repos on Pando; every anomaly becomes a harness regression test</span></label></li>
+    </ul>
+  </div>
+
+  <div class="phase" data-phase="p2">
+    <div class="phase-head">
+      <div class="p-title"><h3>Phase 2 — Something a stranger installs</h3><span class="p-count"></span></div>
+      <div class="goal">~3–6 months from start · enter only if the P1 gate passed.</div>
+      <div class="p-bar"><i></i></div>
+    </div>
+    <div class="gate"><b>Gate</b>First 10 external users retained for a month without hand-holding → decide: product push (agent-fleet wedge) vs. excellent personal/OSS tool.</div>
+    <ul class="tasks">
+      <li><label><input type="checkbox" data-id="p2-1"><span><span class="sub">cloud</span>Hosted authority: R2-class overlay store + Postgres control plane; Tier-1 promotion (<code>pando promote</code>) for BYO boxes</span></label></li>
+      <li><label><input type="checkbox" data-id="p2-2"><span><span class="sub">identity</span>GitHub OAuth onboarding: sign in → repo list → pin → done; multi-remote support (GitLab/Bitbucket/bare)</span></label></li>
+      <li><label><input type="checkbox" data-id="p2-3"><span><span class="sub">keys</span>Real key management: device enrollment via existing-device approval, recovery phrase flow, key rotation — first-class UX design, not an afterthought</span></label></li>
+      <li><label><input type="checkbox" data-id="p2-4"><span><span class="sub">cas</span>Global artifact CAS: platform-keyed public package store, CDN-fronted; optional GitHub-Actions-as-builder</span></label></li>
+      <li><label><input type="checkbox" data-id="p2-5"><span><span class="sub">platform</span>Windows support; installers/packages for all three OSes</span></label></li>
+      <li><label><input type="checkbox" data-id="p2-6"><span><span class="sub">agents</span>Agent leases: branch/worktree-scoped leases so agent fleets and humans share the fabric without contention</span></label></li>
+      <li><label><input type="checkbox" data-id="p2-7"><span><span class="sub">ship</span>Docs, quotas/limits, telemetry (opt-in, never content), publish the landing page, the "Unpushed" launch post</span></label></li>
+    </ul>
+  </div>
+</section>
+
+<section id="open">
+  <h2><span class="sn">§13</span>Open questions</h2>
+  <ul>
+    <li><strong>Lease UX details:</strong> what exactly is "sitting down" (first keystroke? editor focus? fs write?) and "walking away" (idle minutes? lid event?) — needs P0 dogfooding to answer honestly.</li>
+    <li><strong>Session context scope:</strong> do open editor buffers / terminal history / running dev-server state belong in v1, or is that a later "session follows you" layer above the file fabric?</li>
+    <li><strong>Local dev databases:</strong> seeded Postgres/SQLite state is technically "source-ish local state" — sync (big), snapshot on schedule, or recipe-ify (seeds/fixtures)?</li>
+    <li><strong>Implementation language:</strong> Rust (daemon discipline, dura/jj neighborhood) vs Go (boring reliability, easy daemons) — decide at P0 start, with the harness language following.</li>
+    <li><strong>Naming collisions:</strong> pando.com is taken (career SaaS); trademark search in Classes 9/42 before any commercial move.</li>
+  </ul>
+</section>
+
+<footer class="doc-foot">
+  <span>PANDO · working spec v0.1 · july 2026</span>
+  <span><a href="index.html">vision ↗</a></span>
+</footer>
+
+</main>
+</div>
+
+<script>
+(function () {
+  var KEY = "pando-spec-tasks-v1";
+  var state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
+
+  var boxes = document.querySelectorAll('.tasks input[type="checkbox"]');
+  boxes.forEach(function (box) {
+    box.checked = !!state[box.dataset.id];
+    box.addEventListener("change", function () {
+      state[box.dataset.id] = box.checked;
+      try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+      refresh();
+    });
+  });
+
+  function refresh() {
+    document.querySelectorAll(".phase").forEach(function (phase) {
+      var inputs = phase.querySelectorAll('input[type="checkbox"]');
+      var done = phase.querySelectorAll('input[type="checkbox"]:checked').length;
+      phase.querySelector(".p-count").textContent = done + " / " + inputs.length + " done";
+      phase.querySelector(".p-bar i").style.width = (inputs.length ? (done / inputs.length) * 100 : 0) + "%";
+    });
+  }
+  refresh();
+})();
+</script>
+
+</body>
+</html>
