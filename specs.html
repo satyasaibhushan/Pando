@@ -166,7 +166,7 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
       <h1>Pando<span class="dot">.</span> Technical Spec</h1>
     </div>
     <div class="meta">
-      status: <span style="color:#e2a53c">design settled, build not started</span><br>
+      status: <span style="color:#e2a53c">phase 0 implementation ready for field gate</span><br>
       drafted: july 2026 · owner: satyasaibhushan<br>
       <a href="index.html">← the vision page</a>
     </div>
@@ -270,6 +270,13 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
     <div class="option chosen"><span class="glyph">✓</span><div><b>Sync <code>.git</code> as ordinary data — safe only under D4's lease.</b> Branches, stash, index, remote-tracking refs travel with you. (Syncthing's documented repo-corruption failure is exactly what the lease removes.)</div></div>
     <div class="option rejected"><span class="glyph">✕</span><div><b>Replace or wrap git (jj-style).</b> Wrong fight: users' git workflow is sacred (§01 identity).</div></div>
     <div class="verdict"><b>Verdict</b>Sync it under the lease; be git-<em>aware</em> only for divergence merges and the §04 policies. D4 and D6 interlock — neither is safe alone.</div>
+  </div>
+
+  <div class="decision">
+    <div class="d-head"><span class="id">D7 · IMPLEMENTATION</span><span class="q">What is the core implementation language?</span></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Go.</b> Faster initial service iteration, but weaker state modeling for a daemon whose primary promise is never losing work.</div></div>
+    <div class="option chosen"><span class="glyph">✓</span><div><b>Rust.</b> One implementation for the simulation harness, daemon, authority, CLI, and TUI; explicit types around leases and snapshot state; native binaries for every trunk.</div></div>
+    <div class="verdict"><b>Verdict</b>Rust from Phase 0 onward. Avoid an early prototype rewrite; keep the dependency and async surface small.</div>
   </div>
 </section>
 
@@ -451,7 +458,6 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
     <li><strong>Lease UX details:</strong> what exactly is "sitting down" (first keystroke? editor focus? fs write?) and "walking away" (idle minutes? lid event?) — needs P0 dogfooding to answer honestly.</li>
     <li><strong>Session context scope:</strong> do open editor buffers / terminal history / running dev-server state belong in v1, or is that a later "session follows you" layer above the file fabric?</li>
     <li><strong>Local dev databases:</strong> seeded Postgres/SQLite state is technically "source-ish local state" — sync (big), snapshot on schedule, or recipe-ify (seeds/fixtures)?</li>
-    <li><strong>Implementation language:</strong> Rust (daemon discipline, dura/jj neighborhood) vs Go (boring reliability, easy daemons) — decide at P0 start, with the harness language following.</li>
     <li><strong>Naming collisions:</strong> pando.com is taken (career SaaS); trademark search in Classes 9/42 before any commercial move.</li>
   </ul>
 </section>
