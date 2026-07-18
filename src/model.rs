@@ -4,6 +4,10 @@ use std::collections::BTreeMap;
 pub type ChunkHash = String;
 pub type SnapshotId = String;
 
+pub(crate) fn short_id(value: &str) -> &str {
+    &value[..value.len().min(12)]
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileKind {

@@ -260,7 +260,7 @@ fn expect_ok(response: Response) -> Result<()> {
 }
 
 fn write_message(stream: &mut TcpStream, value: &impl Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
+    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
     if bytes.len() > MAX_MESSAGE_BYTES {
         bail!("authority message exceeds {} bytes", MAX_MESSAGE_BYTES);
     }
@@ -279,7 +279,10 @@ fn read_message<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
     }
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes)?;
-    serde_json::from_slice(&bytes).context("decode authority message")
+    let (value, _bytes_read) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .context("decode authority message")?;
+    Ok(value)
 }
 
 #[cfg(test)]

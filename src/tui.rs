@@ -1,5 +1,6 @@
 use crate::authority::Authority;
 use crate::clock::{Clock, SystemClock};
+use crate::model::short_id;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
@@ -52,7 +53,7 @@ fn run_loop(
                     let lease = status.lease.as_ref()
                         .map(|lease| format!("{} · generation {} · {}ms remaining", lease.holder, lease.generation, lease.expires_at_ms.saturating_sub(now)))
                         .unwrap_or_else(|| "free".into());
-                    let head = status.head.as_deref().map(short).unwrap_or("none");
+                    let head = status.head.as_deref().map(short_id).unwrap_or("none");
                     let age = status.last_snapshot_at_ms
                         .map(|time| format!("{}ms", now.saturating_sub(time)))
                         .unwrap_or_else(|| "never".into());
@@ -80,8 +81,4 @@ fn run_loop(
             return Ok(());
         }
     }
-}
-
-fn short(value: &str) -> &str {
-    &value[..value.len().min(12)]
 }

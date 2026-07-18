@@ -1,7 +1,7 @@
 use crate::authority::{AcquireResult, Authority};
 use crate::clock::Clock;
 use crate::model::SnapshotId;
-use crate::snapshot::{capture, materialize_overlay, overlay_against};
+use crate::snapshot::{capture, materialization_delta, materialize_overlay, overlay_against};
 use crate::store::ChunkStore;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -146,22 +146,9 @@ impl Trunk {
                     snapshot: previous.snapshot.id.clone(),
                 });
             }
-            let mut overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
-            if let Some(previous) = previous {
-                for (path, entry) in &overlay.snapshot.files {
-                    if previous.snapshot.files.get(path) != Some(entry) {
-                        overlay.upserts.insert(path.clone(), entry.clone());
-                    }
-                }
-                for path in previous.snapshot.files.keys() {
-                    if !overlay.snapshot.files.contains_key(path) && !overlay.deletes.contains(path)
-                    {
-                        overlay.deletes.push(path.clone());
-                    }
-                }
-            }
+            let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
             let mut uploaded = 0;
-            for entry in overlay.upserts.values() {
+            for entry in overlay.snapshot.files.values() {
                 if !authority.has_chunk(&entry.chunk)? {
                     authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
                     uploaded += 1;
@@ -199,38 +186,48 @@ impl Trunk {
             });
         }
         let overlay = authority.overlay(&authority_head)?;
+        let current = capture(
+            &self.repo,
+            &self.repo_id,
+            &self.trunk_id,
+            state.head.clone(),
+            clock.now_ms(),
+            &self.chunks,
+        )?;
         if let Some(local_head) = &state.head {
             let previous = authority.overlay(local_head)?;
-            let current = capture(
-                &self.repo,
-                &self.repo_id,
-                &self.trunk_id,
-                state.head.clone(),
-                clock.now_ms(),
-                &self.chunks,
-            )?;
             if current.files != previous.snapshot.files {
                 return Ok(PullResult::Diverged {
                     local_head: state.head,
                     authority_head,
                 });
             }
-        } else if !self.initial_tree_is_clean(&overlay)? {
-            return Ok(PullResult::Diverged {
-                local_head: None,
-                authority_head,
-            });
+        } else {
+            if current.files == overlay.snapshot.files {
+                state.head = Some(authority_head.clone());
+                self.save_state(&state)?;
+                return Ok(PullResult::UpToDate {
+                    snapshot: authority_head,
+                });
+            }
+            if !self.initial_tree_is_clean(&overlay, &current.files)? {
+                return Ok(PullResult::Diverged {
+                    local_head: None,
+                    authority_head,
+                });
+            }
         }
 
+        let delta = materialization_delta(&overlay, &current.files);
         let mut downloaded = 0;
-        for entry in overlay.upserts.values() {
+        for entry in delta.upserts.values() {
             if !self.chunks.contains(&entry.chunk) {
                 let bytes = authority.get_chunk(&entry.chunk)?;
                 self.chunks.put_verified(&entry.chunk, &bytes)?;
                 downloaded += 1;
             }
         }
-        materialize_overlay(&self.repo, &overlay, &self.chunks)?;
+        materialize_overlay(&self.repo, &delta, &self.chunks)?;
         state.head = Some(authority_head.clone());
         self.save_state(&state)?;
         Ok(PullResult::Applied {
@@ -280,20 +277,16 @@ impl Trunk {
         Ok(())
     }
 
-    fn initial_tree_is_clean(&self, overlay: &crate::model::Overlay) -> Result<bool> {
+    fn initial_tree_is_clean(
+        &self,
+        overlay: &crate::model::Overlay,
+        current_files: &std::collections::BTreeMap<String, crate::model::FileEntry>,
+    ) -> Result<bool> {
         use std::collections::BTreeMap;
-        let current = capture(
-            &self.repo,
-            &self.repo_id,
-            &self.trunk_id,
-            None,
-            0,
-            &self.chunks,
-        )?;
-        let current_files: BTreeMap<_, _> = current
-            .files
-            .into_iter()
+        let current_files: BTreeMap<_, _> = current_files
+            .iter()
             .filter(|(path, _)| !path.starts_with(".git/"))
+            .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect();
         let baseline = match &overlay.snapshot.base_commit {
             Some(commit) => crate::git::baseline(&self.repo, commit, &self.chunks)?,

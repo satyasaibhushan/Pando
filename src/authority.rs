@@ -102,13 +102,13 @@ impl Authority for FileAuthority {
         {
             return Ok(AcquireResult::HeldBy(lease.clone()));
         }
-        let previous = state.leases.get(repo_id);
-        let generation = if previous.is_some_and(|lease| lease.holder == trunk_id) {
-            previous.map(|lease| lease.generation).unwrap_or(1)
-        } else {
-            let next = state.generations.get(repo_id).copied().unwrap_or(0) + 1;
-            state.generations.insert(repo_id.to_owned(), next);
-            next
+        let generation = match state.leases.get(repo_id) {
+            Some(lease) if lease.holder == trunk_id => lease.generation,
+            _ => {
+                let next = state.generations.get(repo_id).copied().unwrap_or(0) + 1;
+                state.generations.insert(repo_id.to_owned(), next);
+                next
+            }
         };
         let lease = Lease {
             repo_id: repo_id.to_owned(),
@@ -163,7 +163,7 @@ impl Authority for FileAuthority {
                 overlay.snapshot.parent
             );
         }
-        for entry in overlay.upserts.values() {
+        for entry in overlay.snapshot.files.values() {
             if !self.chunks.contains(&entry.chunk) {
                 bail!("snapshot references missing chunk {}", entry.chunk);
             }

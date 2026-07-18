@@ -76,10 +76,9 @@ fn main() -> Result<()> {
         Command::Push(args) => {
             let trunk = open_trunk(&args)?;
             let mut authority = authority(&args.authority)?;
-            println!(
-                "{}",
-                describe_push(&trunk.push(authority.as_mut(), &SystemClock)?)
-            );
+            let result = trunk.push(authority.as_mut(), &SystemClock)?;
+            trunk.release(authority.as_mut())?;
+            println!("{}", describe_push(&result));
             Ok(())
         }
         Command::Pull(args) => {

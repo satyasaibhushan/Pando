@@ -1,5 +1,6 @@
 use crate::authority::Authority;
 use crate::clock::SystemClock;
+use crate::model::short_id;
 use crate::sync::{PullResult, PushResult, Trunk};
 use anyhow::Result;
 use notify::{Event, RecursiveMode, Watcher};
@@ -47,7 +48,7 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
 
     while running.load(Ordering::SeqCst) {
         match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(event)) if relevant(&event) => {
+            Ok(Ok(event)) if relevant(&event, trunk.repo()) => {
                 if std::env::var_os("PANDO_DEBUG").is_some() {
                     eprintln!("watch event: {:?} {:?}", event.kind, event.paths);
                 }
@@ -98,11 +99,11 @@ pub fn describe_push(result: &PushResult) -> String {
             exposure_bytes,
         } => format!(
             "published {} ({} chunks, {} exposure bytes)",
-            short(snapshot),
+            short_id(snapshot),
             chunks_uploaded,
             exposure_bytes
         ),
-        PushResult::NoChanges { snapshot } => format!("no changes ({})", short(snapshot)),
+        PushResult::NoChanges { snapshot } => format!("no changes ({})", short_id(snapshot)),
         PushResult::LeaseHeld {
             holder,
             expires_at_ms,
@@ -121,15 +122,19 @@ pub fn describe_pull(result: &PullResult) -> String {
         PullResult::Applied {
             snapshot,
             chunks_downloaded,
-        } => format!("applied {} ({} chunks)", short(snapshot), chunks_downloaded),
+        } => format!(
+            "applied {} ({} chunks)",
+            short_id(snapshot),
+            chunks_downloaded
+        ),
         PullResult::NoSnapshots => "authority has no snapshots".into(),
-        PullResult::UpToDate { snapshot } => format!("up to date ({})", short(snapshot)),
+        PullResult::UpToDate { snapshot } => format!("up to date ({})", short_id(snapshot)),
         PullResult::Diverged {
             local_head,
             authority_head,
         } => format!(
             "pull refused: dirty local head {local_head:?}, authority {}",
-            short(authority_head)
+            short_id(authority_head)
         ),
     }
 }
@@ -144,14 +149,11 @@ fn report_pull(result: Result<PullResult>) {
     }
 }
 
-fn relevant(event: &Event) -> bool {
+fn relevant(event: &Event, repo: &std::path::Path) -> bool {
     event.paths.iter().any(|path| {
-        !path
-            .components()
-            .any(|part| part == Component::Normal(".pando".as_ref()))
+        path.strip_prefix(repo)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            != Some(Component::Normal(".pando".as_ref()))
     })
-}
-
-fn short(value: &str) -> &str {
-    &value[..value.len().min(12)]
 }

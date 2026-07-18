@@ -1,6 +1,6 @@
 use pando::Clock;
 use pando::authority::{AcquireResult, Authority, FileAuthority};
-use pando::clock::VirtualClock;
+use pando::clock::{SystemClock, VirtualClock};
 use pando::sync::{PullResult, PushResult, Trunk};
 use pando::transport::RemoteAuthority;
 use std::fs;
@@ -272,6 +272,33 @@ fn first_pull_refuses_a_nonempty_untracked_tree() {
 }
 
 #[test]
+fn matching_tree_adopts_the_authority_head_after_state_relocation() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    fs::write(harness.first_path.join("source.txt"), "source\n").unwrap();
+    let first = harness.first();
+    let second = harness.second();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    let relocated = Trunk::open_with_state(
+        &harness.second_path,
+        "repo",
+        "linuxbox",
+        harness.state_path.join("linuxbox-relocated"),
+    )
+    .unwrap();
+    let result = relocated.pull(&authority, &harness.clock).unwrap();
+
+    assert!(matches!(result, PullResult::UpToDate { .. }));
+    assert_eq!(
+        relocated.local_head().unwrap(),
+        authority.head("repo").unwrap()
+    );
+}
+
+#[test]
 fn reverting_a_file_to_its_base_is_transferred() {
     let harness = Harness::plain();
     let mut authority = harness.authority();
@@ -295,6 +322,112 @@ fn reverting_a_file_to_its_base_is_transferred() {
         fs::read_to_string(harness.second_path.join("work.txt")).unwrap(),
         "reverted\n"
     );
+}
+
+#[test]
+fn receiver_two_snapshots_behind_sees_a_revert_to_the_git_base() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("remote.git");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(
+        root.path(),
+        &["init", "-b", "main", source.to_str().unwrap()],
+    );
+    git(&source, &["config", "user.email", "pando@example.test"]);
+    git(&source, &["config", "user.name", "Pando Test"]);
+    fs::write(source.join("work.txt"), "base\n").unwrap();
+    git(&source, &["add", "work.txt"]);
+    git(&source, &["commit", "-m", "base"]);
+    git(
+        &source,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&source, &["push", "-u", "origin", "main"]);
+    git(
+        root.path(),
+        &["clone", remote.to_str().unwrap(), target.to_str().unwrap()],
+    );
+
+    let mut authority = FileAuthority::open(root.path().join("authority")).unwrap();
+    let clock = VirtualClock::at(1_000);
+    let first = Trunk::open_with_state(
+        &source,
+        "repo",
+        "macbook",
+        root.path().join("trunks/macbook"),
+    )
+    .unwrap();
+    let second = Trunk::open_with_state(
+        &target,
+        "repo",
+        "linuxbox",
+        root.path().join("trunks/linuxbox"),
+    )
+    .unwrap();
+
+    fs::write(source.join("work.txt"), "dirty x\n").unwrap();
+    first.push(&mut authority, &clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &clock).unwrap();
+
+    clock.advance(1_000);
+    fs::write(source.join("work.txt"), "base\n").unwrap();
+    first.push(&mut authority, &clock).unwrap();
+    first.release(&mut authority).unwrap();
+    clock.advance(1_000);
+    fs::write(source.join("later.txt"), "newer snapshot\n").unwrap();
+    first.push(&mut authority, &clock).unwrap();
+    first.release(&mut authority).unwrap();
+
+    second.pull(&authority, &clock).unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join("work.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("later.txt")).unwrap(),
+        "newer snapshot\n"
+    );
+}
+
+#[test]
+fn one_shot_cli_push_releases_its_lease() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let authority_path = root.path().join("authority");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("work.txt"), "work\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .env("PANDO_DATA_HOME", root.path().join("client-state"))
+        .args([
+            "push",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--repo-id",
+            "repo",
+            "--trunk-id",
+            "one-shot",
+            "--authority",
+            authority_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut authority = FileAuthority::open(authority_path).unwrap();
+    assert!(matches!(
+        authority
+            .acquire("repo", "other-trunk", SystemClock.now_ms(), 1_000)
+            .unwrap(),
+        AcquireResult::Acquired(_)
+    ));
 }
 
 #[test]
@@ -357,6 +490,36 @@ fn executable_bits_and_symlinks_follow_the_user() {
     assert_eq!(
         fs::read_link(harness.second_path.join("current")).unwrap(),
         PathBuf::from("run.sh")
+    );
+}
+
+#[test]
+fn only_the_root_pando_directory_is_reserved() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    fs::create_dir_all(harness.first_path.join(".pando")).unwrap();
+    fs::write(
+        harness.first_path.join(".pando/local-state.txt"),
+        "must stay local\n",
+    )
+    .unwrap();
+    fs::create_dir_all(harness.first_path.join("docs/.pando")).unwrap();
+    fs::write(
+        harness.first_path.join("docs/.pando/source.txt"),
+        "legitimate nested source\n",
+    )
+    .unwrap();
+
+    let first = harness.first();
+    let second = harness.second();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    assert!(!harness.second_path.join(".pando/local-state.txt").exists());
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("docs/.pando/source.txt")).unwrap(),
+        "legitimate nested source\n"
     );
 }
 

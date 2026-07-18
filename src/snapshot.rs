@@ -22,17 +22,11 @@ pub fn capture(
     for item in WalkDir::new(&canonical_repo)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|item| item.depth() == 0 || item.file_name() != ".pando")
+        .filter_entry(|item| item.depth() != 1 || item.file_name() != ".pando")
     {
         let item = item?;
         let relative = item.path().strip_prefix(&canonical_repo)?;
         if relative.as_os_str().is_empty() {
-            continue;
-        }
-        if relative.components().next() == Some(Component::Normal(".pando".as_ref())) {
-            if item.file_type().is_dir() {
-                continue;
-            }
             continue;
         }
         if item.file_type().is_dir() {
@@ -100,6 +94,26 @@ pub fn overlay_against(repo: &Path, manifest: Manifest, store: &ChunkStore) -> R
     })
 }
 
+pub fn materialization_delta(target: &Overlay, current: &BTreeMap<String, FileEntry>) -> Overlay {
+    let upserts = target
+        .snapshot
+        .files
+        .iter()
+        .filter(|(path, entry)| current.get(*path) != Some(*entry))
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect();
+    let deletes = current
+        .keys()
+        .filter(|path| !target.snapshot.files.contains_key(*path))
+        .cloned()
+        .collect();
+    Overlay {
+        snapshot: target.snapshot.clone(),
+        upserts,
+        deletes,
+    }
+}
+
 pub fn materialize_overlay(repo: &Path, overlay: &Overlay, store: &ChunkStore) -> Result<()> {
     fs::create_dir_all(repo)?;
     for path in &overlay.deletes {
@@ -128,13 +142,10 @@ pub fn materialize_overlay(repo: &Path, overlay: &Overlay, store: &ChunkStore) -
         .contents_first(true)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|item| item.file_name() != ".pando")
+        .filter_entry(|item| item.depth() != 1 || item.file_name() != ".pando")
     {
         let item = item?;
         let relative = item.path().strip_prefix(repo)?;
-        if relative.components().next() == Some(Component::Normal(".pando".as_ref())) {
-            continue;
-        }
         if !item.file_type().is_dir() {
             existing.push((slash_path(relative)?, item.path().to_owned()));
         }
