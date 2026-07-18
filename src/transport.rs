@@ -3,7 +3,7 @@ use crate::model::{Overlay, SnapshotId};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -73,14 +73,11 @@ impl RemoteAuthority {
     }
 
     fn rpc(&self, request: Request) -> Result<Response> {
-        let mut addresses = self
+        let addresses = self
             .address
             .to_socket_addrs()
             .with_context(|| format!("resolve authority {}", self.address))?;
-        let address = addresses
-            .next()
-            .context("authority address resolved to nothing")?;
-        let mut stream = TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))
+        let mut stream = connect_any(addresses, std::time::Duration::from_secs(5))
             .with_context(|| format!("connect to authority {}", self.address))?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
@@ -91,6 +88,22 @@ impl RemoteAuthority {
             other => Ok(other),
         }
     }
+}
+
+fn connect_any(
+    addresses: impl Iterator<Item = SocketAddr>,
+    timeout: std::time::Duration,
+) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no authority addresses")
+    }))
 }
 
 impl Authority for RemoteAuthority {
@@ -267,4 +280,25 @@ fn read_message<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes)?;
     serde_json::from_slice(&bytes).context("decode authority message")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connect_any;
+    use std::net::{Ipv6Addr, SocketAddr, TcpListener};
+    use std::time::Duration;
+
+    #[test]
+    fn connection_falls_back_to_the_next_resolved_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let unreachable = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), reachable.port());
+
+        let stream = connect_any(
+            [unreachable, reachable].into_iter(),
+            Duration::from_millis(100),
+        );
+
+        assert!(stream.is_ok());
+    }
 }

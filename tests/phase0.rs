@@ -12,6 +12,7 @@ use tempfile::TempDir;
 struct Harness {
     _root: TempDir,
     authority_path: PathBuf,
+    state_path: PathBuf,
     first_path: PathBuf,
     second_path: PathBuf,
     clock: VirtualClock,
@@ -21,6 +22,7 @@ impl Harness {
     fn plain() -> Self {
         let root = tempfile::tempdir().unwrap();
         let authority_path = root.path().join("authority");
+        let state_path = root.path().join("trunks");
         let first_path = root.path().join("first");
         let second_path = root.path().join("second");
         fs::create_dir_all(&first_path).unwrap();
@@ -28,6 +30,7 @@ impl Harness {
         Self {
             _root: root,
             authority_path,
+            state_path,
             first_path,
             second_path,
             clock: VirtualClock::at(1_000),
@@ -39,11 +42,23 @@ impl Harness {
     }
 
     fn first(&self) -> Trunk {
-        Trunk::open(&self.first_path, "repo", "macbook").unwrap()
+        Trunk::open_with_state(
+            &self.first_path,
+            "repo",
+            "macbook",
+            self.state_path.join("macbook"),
+        )
+        .unwrap()
     }
 
     fn second(&self) -> Trunk {
-        Trunk::open(&self.second_path, "repo", "linuxbox").unwrap()
+        Trunk::open_with_state(
+            &self.second_path,
+            "repo",
+            "linuxbox",
+            self.state_path.join("linuxbox"),
+        )
+        .unwrap()
     }
 }
 
@@ -99,8 +114,20 @@ fn nested_non_repo_does_not_borrow_its_parent_git_baseline() {
     fs::write(first_path.join("mid-edit.txt"), "this followed me\n").unwrap();
     let mut authority = FileAuthority::open(demo.join("authority")).unwrap();
     let clock = VirtualClock::at(1_000);
-    let first = Trunk::open(&first_path, "demo", "macbook").unwrap();
-    let second = Trunk::open(&second_path, "demo", "linuxbox").unwrap();
+    let first = Trunk::open_with_state(
+        &first_path,
+        "demo",
+        "macbook",
+        demo.join("trunk-state/macbook"),
+    )
+    .unwrap();
+    let second = Trunk::open_with_state(
+        &second_path,
+        "demo",
+        "linuxbox",
+        demo.join("trunk-state/linuxbox"),
+    )
+    .unwrap();
 
     first.push(&mut authority, &clock).unwrap();
     first.release(&mut authority).unwrap();
@@ -129,6 +156,38 @@ fn active_lease_refuses_a_second_writer() {
         .push(&mut authority, &harness.clock)
         .unwrap();
     assert!(matches!(result, PushResult::LeaseHeld { holder, .. } if holder == "macbook"));
+}
+
+#[test]
+fn trunk_bookkeeping_survives_stashing_all_untracked_files() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let state = root.path().join("trunk-state");
+    let authority_path = root.path().join("authority");
+    git(root.path(), &["init", "-b", "main", repo.to_str().unwrap()]);
+    git(&repo, &["config", "user.email", "pando@example.test"]);
+    git(&repo, &["config", "user.name", "Pando Test"]);
+    fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+    git(&repo, &["add", "tracked.txt"]);
+    git(&repo, &["commit", "-m", "base"]);
+
+    let clock = VirtualClock::at(1_000);
+    let trunk = Trunk::open_with_state(&repo, "repo", "macbook", &state).unwrap();
+    let mut authority = FileAuthority::open(&authority_path).unwrap();
+    fs::write(repo.join("untracked.txt"), "stash me\n").unwrap();
+    trunk.push(&mut authority, &clock).unwrap();
+    trunk.release(&mut authority).unwrap();
+    git(&repo, &["stash", "push", "-u", "-m", "portable"]);
+
+    assert!(state.join("state.json").is_file());
+    assert!(state.join("chunks").is_dir());
+    assert!(!repo.join(".pando").exists());
+    assert!(trunk.local_head().unwrap().is_some());
+    clock.advance(1_000);
+    assert!(matches!(
+        trunk.push(&mut authority, &clock).unwrap(),
+        PushResult::Published { .. }
+    ));
 }
 
 #[test]
@@ -392,8 +451,20 @@ fn git_branch_stash_index_and_dirty_files_follow_the_user() {
 
     let mut authority = FileAuthority::open(root.path().join("authority")).unwrap();
     let clock = VirtualClock::at(42_000);
-    let first = Trunk::open(&macbook, "git-repo", "macbook").unwrap();
-    let second = Trunk::open(&linuxbox, "git-repo", "linuxbox").unwrap();
+    let first = Trunk::open_with_state(
+        &macbook,
+        "git-repo",
+        "macbook",
+        root.path().join("trunks/macbook"),
+    )
+    .unwrap();
+    let second = Trunk::open_with_state(
+        &linuxbox,
+        "git-repo",
+        "linuxbox",
+        root.path().join("trunks/linuxbox"),
+    )
+    .unwrap();
     first.push(&mut authority, &clock).unwrap();
     first.release(&mut authority).unwrap();
     second.pull(&authority, &clock).unwrap();

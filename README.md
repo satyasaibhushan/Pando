@@ -59,6 +59,6 @@ The Phase 0 transport is unauthenticated plaintext and must only be used on loca
 - Only the active lease holder can publish.
 - A stale trunk is refused even after the previous lease expires.
 - Pull refuses to overwrite local edits.
-- `.pando` is local bookkeeping and is never captured.
+- Trunk bookkeeping lives outside the repository, so Git operations cannot stash, clean, or check it out.
 
 Phase 0 captures the complete repository—including `.git`—because classification and rehydration arrive in Phase 1. Test on disposable clones before dogfooding it on valuable work.

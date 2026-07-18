@@ -154,8 +154,18 @@ fn demo(root: &Path) -> Result<()> {
     fs::create_dir_all(&second_path)?;
     fs::write(first_path.join("mid-edit.txt"), "this followed me\n")?;
     let mut authority = FileAuthority::open(authority_path)?;
-    let first = Trunk::open(&first_path, "demo", "macbook")?;
-    let second = Trunk::open(&second_path, "demo", "linuxbox")?;
+    let first = Trunk::open_with_state(
+        &first_path,
+        "demo",
+        "macbook",
+        root.join("trunk-state/macbook"),
+    )?;
+    let second = Trunk::open_with_state(
+        &second_path,
+        "demo",
+        "linuxbox",
+        root.join("trunk-state/linuxbox"),
+    )?;
     println!(
         "macbook: {}",
         describe_push(&first.push(&mut authority, &SystemClock)?)

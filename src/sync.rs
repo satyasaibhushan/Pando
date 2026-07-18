@@ -68,7 +68,24 @@ impl Trunk {
     ) -> Result<Self> {
         let repo = repo.into();
         fs::create_dir_all(&repo)?;
-        let state_dir = repo.join(".pando");
+        let repo = repo.canonicalize()?;
+        let repo_id = repo_id.into();
+        let trunk_id = trunk_id.into();
+        let identity = format!("{}\0{}\0{}", repo_id, trunk_id, repo.display());
+        let key = blake3::hash(identity.as_bytes()).to_hex().to_string();
+        let state_dir = default_data_root()?.join("trunks").join(key);
+        Self::open_with_state(repo, repo_id, trunk_id, state_dir)
+    }
+
+    pub fn open_with_state(
+        repo: impl Into<PathBuf>,
+        repo_id: impl Into<String>,
+        trunk_id: impl Into<String>,
+        state_dir: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let repo = repo.into();
+        fs::create_dir_all(&repo)?;
+        let state_dir = state_dir.into();
         fs::create_dir_all(&state_dir)?;
         let chunks = ChunkStore::new(state_dir.join("chunks"))?;
         let trunk = Self {
@@ -241,7 +258,11 @@ impl Trunk {
     }
 
     fn state_path(&self) -> PathBuf {
-        self.repo.join(".pando/state.json")
+        self.chunks
+            .root()
+            .parent()
+            .unwrap_or_else(|| self.chunks.root())
+            .join("state.json")
     }
 
     fn load_state(&self) -> Result<LocalState> {
@@ -279,5 +300,25 @@ impl Trunk {
             None => BTreeMap::new(),
         };
         Ok(current_files == baseline)
+    }
+}
+
+fn default_data_root() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("PANDO_DATA_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    #[cfg(target_os = "macos")]
+    return Ok(PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("Pando"));
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+            Ok(PathBuf::from(path).join("pando"))
+        } else {
+            Ok(PathBuf::from(home).join(".local/share/pando"))
+        }
     }
 }
