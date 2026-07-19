@@ -61,11 +61,16 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
 
     let clock = SystemClock;
     let mut classifier = Classifier::load(trunk.repo())?;
-    let mut hydrator = options
+    let hydrator = options
         .rehydrate
         .then(|| Hydrator::open(trunk.repo()))
         .transpose()?;
-    report_pull(trunk.pull(authority.as_ref(), &clock), hydrator.as_mut());
+    let mut async_hydrator = hydrator.map(AsyncHydrator::new);
+    if report_pull(trunk.pull(authority.as_ref(), &clock))
+        && let Some(hydrator) = async_hydrator.as_mut()
+    {
+        hydrator.trigger();
+    }
     let mut dirty_at = None;
     let mut last_activity = None;
     let mut last_poll = Instant::now();
@@ -77,6 +82,9 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
     let mut lease_released = true;
 
     while running.load(Ordering::SeqCst) {
+        if let Some(hydrator) = async_hydrator.as_mut() {
+            hydrator.poll();
+        }
         if let Ok(report) = fetch_receiver.try_recv() {
             fetch_running.store(false, Ordering::SeqCst);
             match report {
@@ -200,7 +208,11 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
         }
 
         if dirty_at.is_none() && last_poll.elapsed() >= options.poll_interval {
-            report_pull(trunk.pull(authority.as_ref(), &clock), hydrator.as_mut());
+            if report_pull(trunk.pull(authority.as_ref(), &clock))
+                && let Some(hydrator) = async_hydrator.as_mut()
+            {
+                hydrator.trigger();
+            }
             last_poll = Instant::now();
         }
     }
@@ -268,20 +280,66 @@ pub fn describe_pull(result: &PullResult) -> String {
     }
 }
 
-fn report_pull(result: Result<PullResult>, hydrator: Option<&mut Hydrator>) {
+struct AsyncHydrator {
+    hydrator: Option<Hydrator>,
+    pending: bool,
+    sender: mpsc::Sender<(Hydrator, Result<crate::rehydrate::HydrationSummary>)>,
+    receiver: mpsc::Receiver<(Hydrator, Result<crate::rehydrate::HydrationSummary>)>,
+}
+
+impl AsyncHydrator {
+    fn new(hydrator: Hydrator) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            hydrator: Some(hydrator),
+            pending: false,
+            sender,
+            receiver,
+        }
+    }
+
+    fn trigger(&mut self) {
+        let Some(mut hydrator) = self.hydrator.take() else {
+            self.pending = true;
+            return;
+        };
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let result = hydrator.run_changed(false);
+            let _ = sender.send((hydrator, result));
+        });
+    }
+
+    fn poll(&mut self) {
+        let Ok((hydrator, result)) = self.receiver.try_recv() else {
+            return;
+        };
+        match result {
+            Ok(summary) => println!("{summary}"),
+            Err(error) => eprintln!("rehydration failed: {error:#}"),
+        }
+        self.hydrator = Some(hydrator);
+        if std::mem::take(&mut self.pending) {
+            self.trigger();
+        }
+    }
+}
+
+fn report_pull(result: Result<PullResult>) -> bool {
     match result {
         Ok(result @ PullResult::Applied { .. }) => {
             println!("{}", describe_pull(&result));
-            if let Some(hydrator) = hydrator {
-                match hydrator.run_changed(false) {
-                    Ok(summary) => println!("{summary}"),
-                    Err(error) => eprintln!("rehydration failed: {error:#}"),
-                }
-            }
+            true
         }
-        Ok(result @ PullResult::Diverged { .. }) => println!("{}", describe_pull(&result)),
-        Ok(_) => {}
-        Err(error) => eprintln!("pull failed: {error:#}"),
+        Ok(result @ PullResult::Diverged { .. }) => {
+            println!("{}", describe_pull(&result));
+            false
+        }
+        Ok(_) => false,
+        Err(error) => {
+            eprintln!("pull failed: {error:#}");
+            false
+        }
     }
 }
 

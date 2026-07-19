@@ -132,7 +132,7 @@ pando watch \
   --rehydrate
 ```
 
-Pando invokes only these known executables directly—never through a shell—and caches successful fingerprints outside the repository. Unchanged inputs are skipped, failed recipes are retried, and `pando hydrate --force` deliberately reruns every detected recipe. Watcher events inside classified derived trees are ignored, so rebuilding `node_modules` or `.venv` does not publish snapshots.
+Pando invokes only these known executables directly—never through a shell—and caches successful fingerprints outside the repository. Supported lockfile recipes cover npm, pnpm, Yarn, Bun, uv, Poetry, Cargo, and Go. Unchanged inputs are skipped, failed recipes are retried, and `pando hydrate --force` deliberately reruns every detected recipe. In watcher mode recipes run on a worker thread after materialization, so installs and downloads do not block snapshot, lease, fetch, or pull processing. Watcher events inside classified derived trees are ignored, so rebuilding `node_modules` or `.venv` does not publish snapshots.
 
 Rehydration is opt-in because package managers can access the network and may execute lifecycle scripts or build hooks from the repository and its dependencies. Enable it only for repositories you trust.
 

@@ -241,6 +241,39 @@ fn detect_recipes(repo: &Path) -> Result<Vec<Recipe>> {
                 &["sync", "--frozen"][..],
                 parent.join("pyproject.toml"),
             ),
+            Some("pnpm-lock.yaml") if parent.join("package.json").is_file() => (
+                "pnpm",
+                "pnpm",
+                &["install", "--frozen-lockfile"][..],
+                parent.join("package.json"),
+            ),
+            Some("yarn.lock") if parent.join("package.json").is_file() => (
+                "yarn",
+                "yarn",
+                &["install", "--frozen-lockfile"][..],
+                parent.join("package.json"),
+            ),
+            Some("bun.lock" | "bun.lockb") if parent.join("package.json").is_file() => (
+                "bun",
+                "bun",
+                &["install", "--frozen-lockfile"][..],
+                parent.join("package.json"),
+            ),
+            Some("poetry.lock") if parent.join("pyproject.toml").is_file() => (
+                "poetry",
+                "poetry",
+                &["install", "--no-interaction"][..],
+                parent.join("pyproject.toml"),
+            ),
+            Some("Cargo.lock") if parent.join("Cargo.toml").is_file() => (
+                "cargo",
+                "cargo",
+                &["fetch", "--locked"][..],
+                parent.join("Cargo.toml"),
+            ),
+            Some("go.sum") if parent.join("go.mod").is_file() => {
+                ("go", "go", &["mod", "download"][..], parent.join("go.mod"))
+            }
             _ => continue,
         };
         let relative = parent.strip_prefix(repo)?;
@@ -301,6 +334,10 @@ mod tests {
         write(&root.path().join("package-lock.json"), "{}");
         write(&root.path().join("services/api/pyproject.toml"), "");
         write(&root.path().join("services/api/uv.lock"), "");
+        write(&root.path().join("apps/web/package.json"), "{}");
+        write(&root.path().join("apps/web/pnpm-lock.yaml"), "");
+        write(&root.path().join("tools/Cargo.toml"), "");
+        write(&root.path().join("tools/Cargo.lock"), "");
         write(&root.path().join("node_modules/x/package.json"), "{}");
         write(&root.path().join("node_modules/x/package-lock.json"), "{}");
         write(&root.path().join("target/x/pyproject.toml"), "");
@@ -311,11 +348,18 @@ mod tests {
         let recipes = hydrator.recipes().unwrap();
         let ids: Vec<_> = recipes.iter().map(|recipe| recipe.id()).collect();
 
-        assert_eq!(ids, ["npm:.", "uv:services/api"]);
-        assert_eq!(recipes[0].program(), "npm");
-        assert_eq!(recipes[0].args(), ["ci"]);
-        assert_eq!(recipes[1].program(), "uv");
-        assert_eq!(recipes[1].args(), ["sync", "--frozen"]);
+        assert_eq!(
+            ids,
+            ["cargo:tools", "npm:.", "pnpm:apps/web", "uv:services/api"]
+        );
+        assert_eq!(recipes[0].program(), "cargo");
+        assert_eq!(recipes[0].args(), ["fetch", "--locked"]);
+        assert_eq!(recipes[1].program(), "npm");
+        assert_eq!(recipes[1].args(), ["ci"]);
+        assert_eq!(recipes[2].program(), "pnpm");
+        assert_eq!(recipes[2].args(), ["install", "--frozen-lockfile"]);
+        assert_eq!(recipes[3].program(), "uv");
+        assert_eq!(recipes[3].args(), ["sync", "--frozen"]);
     }
 
     #[test]
