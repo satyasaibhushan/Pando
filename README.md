@@ -60,6 +60,14 @@ pando-restore --repo . --repo-id my-project --trunk-id macbook \
   --destination ../my-project-recovered
 ```
 
+Install the watcher as a launchd agent on macOS or a systemd user service on Linux. The generated service invokes Pando directly without a shell. Omit `--activate` to inspect the installed unit before loading it; `--platform` is normally inferred:
+
+```console
+pando service install --repo ~/Code/project --repo-id project --trunk-id macbook \
+  --authority tcp://linuxbox.local:7337 --key ~/.config/pando/fabric.key \
+  --rehydrate --activate
+```
+
 ```sh
 pando watch \
   --repo ~/Code/project \

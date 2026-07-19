@@ -436,7 +436,8 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
       <li><label><input type="checkbox" data-id="p1-8a" checked><span><span class="sub">integrity</span>60-second classified full-scan watcher backstop + read-only <code>pando verify</code> audit of chunk hashes, snapshot IDs, overlay shape, ancestry, and heads</span></label></li>
       <li><label><input type="checkbox" data-id="p1-8b" checked><span><span class="sub">integrity</span>Safe restore from any retained snapshot into a new atomic destination; hash/path/symlink validation and no overwrite mode</span></label></li>
       <li><label><input type="checkbox" data-id="p1-8"><span><span class="sub">integrity</span>Scheduled audit/restore drill exercised weekly on real repositories</span></label></li>
-      <li><label><input type="checkbox" data-id="p1-9"><span><span class="sub">platform</span>macOS + Linux solid: sleep/wake, APFS case quirks, systemd/launchd packaging of the daemon</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-9a" checked><span><span class="sub">platform</span>Atomic launchd + systemd user-service installer, explicit activation, crash restart, direct no-shell execution, and case-collision refusal before materialization</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-9"><span><span class="sub">platform</span>Exercise sleep/wake and filesystem behavior on sustained real macOS + Linux dogfood runs</span></label></li>
       <li><label><input type="checkbox" data-id="p1-10"><span><span class="sub">dogfood</span>All personal repos on Pando; every anomaly becomes a harness regression test</span></label></li>
       <li><label><input type="checkbox" data-id="p1-11"><span><span class="sub">control</span>After the security and classification baseline lands, run the two-week Pando vs. remote-development control experiment and log every friction moment</span></label></li>
     </ul>

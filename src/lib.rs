@@ -6,6 +6,7 @@ pub mod escape;
 pub mod git;
 pub mod model;
 pub mod rehydrate;
+pub mod service;
 pub mod snapshot;
 pub mod store;
 pub mod sync;

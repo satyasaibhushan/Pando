@@ -42,6 +42,10 @@ enum Command {
         #[command(subcommand)]
         command: EscapeCommand,
     },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     Reconcile {
         #[command(flatten)]
         trunk: TrunkArgs,
@@ -141,6 +145,36 @@ enum EscapeCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceCommand {
+    Install {
+        #[command(flatten)]
+        trunk: TrunkArgs,
+        #[arg(long, value_enum)]
+        platform: Option<CliServicePlatform>,
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        #[arg(long)]
+        output_directory: Option<PathBuf>,
+        #[arg(long)]
+        activate: bool,
+        #[arg(long, default_value_t = 750)]
+        quiescence_ms: u64,
+        #[arg(long, default_value_t = 3_000)]
+        idle_ms: u64,
+        #[arg(long, default_value_t = 60)]
+        full_scan_secs: u64,
+        #[arg(long, default_value_t = 30)]
+        fetch_secs: u64,
+        #[arg(long, default_value_t = 600)]
+        escape_secs: u64,
+        #[arg(long, default_value = "origin")]
+        escape_remote: String,
+        #[arg(long)]
+        rehydrate: bool,
+    },
+}
+
 #[derive(clap::Args)]
 struct TrunkArgs {
     #[arg(long, default_value = ".")]
@@ -160,6 +194,21 @@ enum CliReconcileChoice {
     Authority,
     Fork,
     Manual,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliServicePlatform {
+    Launchd,
+    Systemd,
+}
+
+impl From<CliServicePlatform> for pando::service::ServicePlatform {
+    fn from(value: CliServicePlatform) -> Self {
+        match value {
+            CliServicePlatform::Launchd => Self::Launchd,
+            CliServicePlatform::Systemd => Self::Systemd,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -272,6 +321,72 @@ fn main() -> Result<()> {
                     report.bytes,
                     report.snapshot,
                     destination.display()
+                );
+                Ok(())
+            }
+        },
+        Command::Service { command } => match command {
+            ServiceCommand::Install {
+                trunk,
+                platform,
+                binary,
+                output_directory,
+                activate,
+                quiescence_ms,
+                idle_ms,
+                full_scan_secs,
+                fetch_secs,
+                escape_secs,
+                escape_remote,
+                rehydrate,
+            } => {
+                let key = trunk
+                    .key
+                    .as_deref()
+                    .context("service installation requires --key or PANDO_KEY")?
+                    .canonicalize()
+                    .context("resolve service key")?;
+                let repo = trunk
+                    .repo
+                    .canonicalize()
+                    .context("resolve service repository")?;
+                let binary = binary
+                    .unwrap_or(std::env::current_exe()?)
+                    .canonicalize()
+                    .context("resolve service binary")?;
+                let platform = platform
+                    .map(Into::into)
+                    .map(Ok)
+                    .unwrap_or_else(pando::service::ServicePlatform::native)?;
+                let report = pando::service::install(
+                    &pando::service::ServiceSpec {
+                        binary,
+                        repo,
+                        repo_id: trunk.repo_id,
+                        trunk_id: trunk.trunk_id,
+                        authority: trunk.authority,
+                        key,
+                        quiescence_ms,
+                        idle_ms,
+                        full_scan_secs,
+                        fetch_secs,
+                        escape_secs,
+                        escape_remote,
+                        rehydrate,
+                    },
+                    platform,
+                    output_directory.as_deref(),
+                    activate,
+                )?;
+                println!(
+                    "{} service {} at {}",
+                    if report.activated {
+                        "activated"
+                    } else {
+                        "installed"
+                    },
+                    report.service_name,
+                    report.path.display()
                 );
                 Ok(())
             }
