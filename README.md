@@ -50,7 +50,7 @@ pando watch \
 
 The watcher performs a complete classified-tree scan every 60 seconds as a backstop for missed filesystem notifications. Adjust it with `--full-scan-secs`; event-driven snapshots still use the shorter quiescence window.
 
-For Git repositories, the watcher also runs `git fetch --all --prune` every 30 seconds on a background thread. It updates remote-tracking refs but never checks out, merges, rebases, or pulls. Use `--fetch-secs 0` to disable it or run `pando fetch --repo ~/Code/project` explicitly. Because `.git` is portable state, refreshed remote-tracking refs follow the repository to other trunks.
+For Git repositories, the watcher also runs `git fetch --all --prune` every 30 seconds on a background thread. It updates remote-tracking refs but never checks out, merges, rebases, or pulls. Use `--fetch-secs 0` to disable it or run `pando fetch --repo ~/Code/project` explicitly. Because `.git` is portable state, refreshed remote-tracking refs follow the repository to other trunks. When a remote ref is force-pushed, Pando pins the previous commit under a local `refs/pando/rescue/...` ref so Git garbage collection cannot discard its commit and tree metadata; complete snapshot file content is already retained in Pando's chunk store.
 
 ```sh
 pando watch \

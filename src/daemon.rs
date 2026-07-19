@@ -82,6 +82,9 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
                             "updated"
                         };
                         println!("remote {} {movement}", change.reference);
+                        if let Some(rescue_ref) = change.rescue_ref {
+                            println!("rescued previous Git base as {rescue_ref}");
+                        }
                     }
                 }
                 Err(error) => eprintln!("git fetch failed: {error:#}"),

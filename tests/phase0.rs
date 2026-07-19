@@ -1368,6 +1368,8 @@ fn fetch_reports_fast_forward_and_forced_remote_movement() {
         "refs/remotes/origin/main"
     );
     assert!(!fast_forward.changes[0].forced);
+    assert!(fast_forward.changes[0].rescue_ref.is_none());
+    let endangered = fast_forward.changes[0].after.clone().unwrap();
 
     git(&source, &["reset", "--hard", "HEAD~1"]);
     fs::write(source.join("work.txt"), "alternate\n").unwrap();
@@ -1376,6 +1378,17 @@ fn fetch_reports_fast_forward_and_forced_remote_movement() {
     let forced = pando::git::fetch_remotes(&clone).unwrap();
     assert_eq!(forced.changes.len(), 1);
     assert!(forced.changes[0].forced);
+    assert_eq!(forced.changes[0].before.as_deref(), Some(&*endangered));
+    let rescue_ref = forced.changes[0].rescue_ref.as_deref().unwrap();
+    assert_eq!(git_output(&clone, &["rev-parse", rescue_ref]), endangered);
+
+    git(&clone, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&clone, &["gc", "--prune=now"]);
+    assert_eq!(git_output(&clone, &["rev-parse", rescue_ref]), endangered);
+    git(
+        &clone,
+        &["cat-file", "-e", &format!("{endangered}^{{tree}}")],
+    );
 }
 
 fn git(cwd: &Path, args: &[&str]) {

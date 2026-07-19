@@ -11,6 +11,7 @@ pub struct RemoteRefChange {
     pub before: Option<String>,
     pub after: Option<String>,
     pub forced: bool,
+    pub rescue_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -52,14 +53,33 @@ pub fn fetch_remotes(repo: &Path) -> Result<FetchReport> {
             }
             _ => false,
         };
+        let rescue_ref = if forced {
+            old.as_deref()
+                .map(|commit| rescue_commit(repo, &reference, commit))
+                .transpose()?
+        } else {
+            None
+        };
         changes.push(RemoteRefChange {
             reference,
             before: old,
             after: new,
             forced,
+            rescue_ref,
         });
     }
     Ok(FetchReport { changes })
+}
+
+fn rescue_commit(repo: &Path, remote_ref: &str, commit: &str) -> Result<String> {
+    if !git_succeeds(repo, &["cat-file", "-e", &format!("{commit}^{{commit}}")]) {
+        bail!("cannot rescue missing commit {commit} from {remote_ref}");
+    }
+    let reference_hash = blake3::hash(remote_ref.as_bytes()).to_hex();
+    let rescue_ref = format!("refs/pando/rescue/{reference_hash}/{commit}");
+    git(repo, &["update-ref", &rescue_ref, commit])
+        .with_context(|| format!("preserve {commit} as {rescue_ref}"))?;
+    Ok(rescue_ref)
 }
 
 fn remote_refs(repo: &Path) -> Result<BTreeMap<String, String>> {

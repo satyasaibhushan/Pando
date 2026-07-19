@@ -182,6 +182,9 @@ fn main() -> Result<()> {
                         "updated"
                     }
                 );
+                if let Some(rescue_ref) = change.rescue_ref {
+                    println!("  rescued previous Git base as {rescue_ref}");
+                }
             }
             Ok(())
         }
