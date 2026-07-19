@@ -4,6 +4,7 @@ pub mod clock;
 pub mod daemon;
 pub mod git;
 pub mod model;
+pub mod rehydrate;
 pub mod snapshot;
 pub mod store;
 pub mod sync;
