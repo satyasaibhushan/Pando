@@ -1331,6 +1331,53 @@ fn git_branch_stash_index_and_dirty_files_follow_the_user() {
     assert!(git_output(&linuxbox, &["stash", "list"]).contains("portable stash"));
 }
 
+#[test]
+fn fetch_reports_fast_forward_and_forced_remote_movement() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("remote.git");
+    let source = root.path().join("source");
+    let clone = root.path().join("clone");
+    git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(
+        root.path(),
+        &["init", "-b", "main", source.to_str().unwrap()],
+    );
+    git(&source, &["config", "user.email", "pando@example.test"]);
+    git(&source, &["config", "user.name", "Pando Test"]);
+    fs::write(source.join("work.txt"), "one\n").unwrap();
+    git(&source, &["add", "work.txt"]);
+    git(&source, &["commit", "-m", "one"]);
+    git(
+        &source,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&source, &["push", "-u", "origin", "main"]);
+    git(
+        root.path(),
+        &["clone", remote.to_str().unwrap(), clone.to_str().unwrap()],
+    );
+
+    fs::write(source.join("work.txt"), "two\n").unwrap();
+    git(&source, &["commit", "-am", "two"]);
+    git(&source, &["push", "origin", "main"]);
+    let fast_forward = pando::git::fetch_remotes(&clone).unwrap();
+    assert_eq!(fast_forward.changes.len(), 1);
+    assert_eq!(
+        fast_forward.changes[0].reference,
+        "refs/remotes/origin/main"
+    );
+    assert!(!fast_forward.changes[0].forced);
+
+    git(&source, &["reset", "--hard", "HEAD~1"]);
+    fs::write(source.join("work.txt"), "alternate\n").unwrap();
+    git(&source, &["commit", "-am", "alternate"]);
+    git(&source, &["push", "--force", "origin", "main"]);
+    let forced = pando::git::fetch_remotes(&clone).unwrap();
+    assert_eq!(forced.changes.len(), 1);
+    assert!(forced.changes[0].forced);
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")

@@ -18,6 +18,7 @@ pub struct WatchOptions {
     pub idle_release: Duration,
     pub poll_interval: Duration,
     pub full_scan_interval: Duration,
+    pub fetch_interval: Duration,
     pub rehydrate: bool,
 }
 
@@ -28,6 +29,7 @@ impl Default for WatchOptions {
             idle_release: Duration::from_secs(3),
             poll_interval: Duration::from_secs(1),
             full_scan_interval: Duration::from_secs(60),
+            fetch_interval: Duration::from_secs(30),
             rehydrate: false,
         }
     }
@@ -61,9 +63,44 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
     let mut last_activity = None;
     let mut last_poll = Instant::now();
     let mut last_full_scan = Instant::now();
+    let mut last_fetch = Instant::now();
+    let fetch_running = Arc::new(AtomicBool::new(false));
+    let (fetch_sender, fetch_receiver) = mpsc::channel::<Result<crate::git::FetchReport>>();
     let mut lease_released = true;
 
     while running.load(Ordering::SeqCst) {
+        if let Ok(report) = fetch_receiver.try_recv() {
+            fetch_running.store(false, Ordering::SeqCst);
+            match report {
+                Ok(report) => {
+                    for change in report.changes {
+                        let movement = if change.forced {
+                            "non-fast-forward"
+                        } else if change.after.is_none() {
+                            "deleted"
+                        } else {
+                            "updated"
+                        };
+                        println!("remote {} {movement}", change.reference);
+                    }
+                }
+                Err(error) => eprintln!("git fetch failed: {error:#}"),
+            }
+        }
+        if dirty_at.is_none()
+            && !options.fetch_interval.is_zero()
+            && last_fetch.elapsed() >= options.fetch_interval
+            && fetch_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let repo = trunk.repo().to_owned();
+            let sender = fetch_sender.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(crate::git::fetch_remotes(&repo));
+            });
+            last_fetch = Instant::now();
+        }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(event)) => {
                 let rules_changed =

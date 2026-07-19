@@ -34,6 +34,10 @@ enum Command {
     },
     Push(TrunkArgs),
     Pull(TrunkArgs),
+    Fetch {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     Reconcile {
         #[command(flatten)]
         trunk: TrunkArgs,
@@ -76,6 +80,8 @@ enum Command {
         idle_ms: u64,
         #[arg(long, default_value_t = 60)]
         full_scan_secs: u64,
+        #[arg(long, default_value_t = 30)]
+        fetch_secs: u64,
         #[arg(long)]
         rehydrate: bool,
     },
@@ -157,6 +163,26 @@ fn main() -> Result<()> {
                 "{}",
                 describe_pull(&trunk.pull(authority.as_ref(), &SystemClock)?)
             );
+            Ok(())
+        }
+        Command::Fetch { repo } => {
+            let report = pando::git::fetch_remotes(&repo)?;
+            if report.changes.is_empty() {
+                println!("remote-tracking refs unchanged");
+            }
+            for change in report.changes {
+                println!(
+                    "{}: {}",
+                    change.reference,
+                    if change.forced {
+                        "non-fast-forward"
+                    } else if change.after.is_none() {
+                        "deleted"
+                    } else {
+                        "updated"
+                    }
+                );
+            }
             Ok(())
         }
         Command::Reconcile {
@@ -251,6 +277,7 @@ fn main() -> Result<()> {
             quiescence_ms,
             idle_ms,
             full_scan_secs,
+            fetch_secs,
             rehydrate,
         } => {
             let authority = authority(&trunk.authority, trunk.key.as_deref())?;
@@ -262,6 +289,7 @@ fn main() -> Result<()> {
                     quiescence: Duration::from_millis(quiescence_ms),
                     idle_release: Duration::from_millis(idle_ms),
                     full_scan_interval: Duration::from_secs(full_scan_secs),
+                    fetch_interval: Duration::from_secs(fetch_secs),
                     rehydrate,
                     ..WatchOptions::default()
                 },

@@ -5,6 +5,92 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteRefChange {
+    pub reference: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub forced: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FetchReport {
+    pub changes: Vec<RemoteRefChange>,
+}
+
+pub fn fetch_remotes(repo: &Path) -> Result<FetchReport> {
+    if !is_repository_root(repo) {
+        return Ok(FetchReport::default());
+    }
+    let before = remote_refs(repo)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--all", "--prune", "--no-write-fetch-head"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("run git fetch --all --prune")?;
+    if !output.status.success() {
+        bail!(
+            "git fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let after = remote_refs(repo)?;
+    let references: std::collections::BTreeSet<_> =
+        before.keys().chain(after.keys()).cloned().collect();
+    let mut changes = Vec::new();
+    for reference in references {
+        let old = before.get(&reference).cloned();
+        let new = after.get(&reference).cloned();
+        if old == new {
+            continue;
+        }
+        let forced = match (&old, &new) {
+            (Some(old), Some(new)) => {
+                !git_succeeds(repo, &["merge-base", "--is-ancestor", old, new])
+            }
+            _ => false,
+        };
+        changes.push(RemoteRefChange {
+            reference,
+            before: old,
+            after: new,
+            forced,
+        });
+    }
+    Ok(FetchReport { changes })
+}
+
+fn remote_refs(repo: &Path) -> Result<BTreeMap<String, String>> {
+    let output = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            "refs/remotes/",
+        ],
+    )?;
+    let mut refs = BTreeMap::new();
+    for line in output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let Some(separator) = line.iter().position(|byte| *byte == 0) else {
+            bail!("unexpected remote ref record");
+        };
+        let reference = std::str::from_utf8(&line[..separator])?.to_owned();
+        if reference.ends_with("/HEAD") {
+            continue;
+        }
+        refs.insert(
+            reference,
+            std::str::from_utf8(&line[separator + 1..])?.to_owned(),
+        );
+    }
+    Ok(refs)
+}
+
 pub fn pushed_base(repo: &Path) -> Result<Option<String>> {
     if !is_repository_root(repo) {
         return Ok(None);
