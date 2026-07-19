@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::{DirEntry, WalkDir};
@@ -18,6 +18,7 @@ pub struct Recipe {
     args: &'static [&'static str],
     working_dir: PathBuf,
     inputs: Vec<PathBuf>,
+    outputs: &'static [&'static str],
 }
 
 impl Recipe {
@@ -41,6 +42,7 @@ impl Recipe {
         let mut hasher = blake3::Hasher::new();
         hash_field(&mut hasher, self.id.as_bytes());
         hash_field(&mut hasher, self.program.as_bytes());
+        hash_field(&mut hasher, self.working_dir.as_os_str().as_encoded_bytes());
         for argument in self.args {
             hash_field(&mut hasher, argument.as_bytes());
         }
@@ -73,11 +75,20 @@ impl Recipe {
         }
         Ok(())
     }
+
+    fn outputs_ready(&self) -> bool {
+        !self.outputs.is_empty()
+            && self
+                .outputs
+                .iter()
+                .all(|output| fs::symlink_metadata(self.working_dir.join(output)).is_ok())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HydrationSummary {
     pub ran: Vec<String>,
+    pub restored: Vec<String>,
     pub skipped: Vec<String>,
 }
 
@@ -85,12 +96,16 @@ impl fmt::Display for HydrationSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "rehydration: ran {}, skipped {} unchanged",
+            "rehydration: ran {}, restored {}, skipped {} unchanged",
             self.ran.len(),
+            self.restored.len(),
             self.skipped.len()
         )?;
         if !self.ran.is_empty() {
             write!(formatter, " ({})", self.ran.join(", "))?;
+        }
+        if !self.restored.is_empty() {
+            write!(formatter, " (cache: {})", self.restored.join(", "))?;
         }
         Ok(())
     }
@@ -106,6 +121,7 @@ struct HydrationState {
 pub struct Hydrator {
     repo: PathBuf,
     state_path: PathBuf,
+    artifact_root: PathBuf,
     state: HydrationState,
 }
 
@@ -161,6 +177,13 @@ impl Hydrator {
         Ok(Self {
             repo: canonical,
             state_path,
+            artifact_root: crate::sync::default_data_root()?
+                .join("artifacts")
+                .join(format!(
+                    "{}-{}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )),
             state,
         })
     }
@@ -170,10 +193,23 @@ impl Hydrator {
     }
 
     pub fn run_changed(&mut self, force: bool) -> Result<HydrationSummary> {
-        self.run_changed_with(force, Recipe::execute)
+        self.run_changed_with_cache(force, true, Recipe::execute)
     }
 
-    fn run_changed_with<F>(&mut self, force: bool, mut run: F) -> Result<HydrationSummary>
+    #[cfg(test)]
+    fn run_changed_with<F>(&mut self, force: bool, run: F) -> Result<HydrationSummary>
+    where
+        F: FnMut(&Recipe) -> Result<()>,
+    {
+        self.run_changed_with_cache(force, false, run)
+    }
+
+    fn run_changed_with_cache<F>(
+        &mut self,
+        force: bool,
+        use_cache: bool,
+        mut run: F,
+    ) -> Result<HydrationSummary>
     where
         F: FnMut(&Recipe) -> Result<()>,
     {
@@ -186,16 +222,100 @@ impl Hydrator {
                     .successful
                     .get(recipe.id())
                     .is_some_and(|saved| saved == &fingerprint)
+                && (!use_cache || recipe.outputs.is_empty() || recipe.outputs_ready())
             {
                 summary.skipped.push(recipe.id.clone());
                 continue;
             }
+            if !force && use_cache && self.restore_artifact(&recipe, &fingerprint)? {
+                self.state.successful.insert(recipe.id.clone(), fingerprint);
+                self.save()?;
+                summary.restored.push(recipe.id);
+                continue;
+            }
             run(&recipe)?;
+            if use_cache {
+                self.store_artifact(&recipe, &fingerprint)?;
+            }
             self.state.successful.insert(recipe.id.clone(), fingerprint);
             self.save()?;
             summary.ran.push(recipe.id);
         }
         Ok(summary)
+    }
+
+    fn restore_artifact(&self, recipe: &Recipe, fingerprint: &str) -> Result<bool> {
+        if recipe.outputs.is_empty() || recipe.outputs_ready() {
+            return Ok(false);
+        }
+        let pointer = self.artifact_root.join("inputs").join(fingerprint);
+        let hash = match fs::read_to_string(&pointer) {
+            Ok(hash) => hash.trim().to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("invalid artifact cache pointer {}", pointer.display());
+        }
+        let archive = self
+            .artifact_root
+            .join("objects")
+            .join(format!("{hash}.tar"));
+        if hash_file(&archive)? != hash {
+            bail!("artifact cache object {hash} failed verification");
+        }
+        let status = Command::new("tar")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&recipe.working_dir)
+            .status()
+            .with_context(|| format!("restore cached artifact for {}", recipe.id))?;
+        if !status.success() || !recipe.outputs_ready() {
+            bail!("restore cached artifact for {} failed", recipe.id);
+        }
+        Ok(true)
+    }
+
+    fn store_artifact(&self, recipe: &Recipe, fingerprint: &str) -> Result<()> {
+        if !recipe.outputs_ready() {
+            return Ok(());
+        }
+        let objects = self.artifact_root.join("objects");
+        let inputs = self.artifact_root.join("inputs");
+        fs::create_dir_all(&objects)?;
+        fs::create_dir_all(&inputs)?;
+        let temporary = self
+            .artifact_root
+            .join(format!("artifact-{}.partial", std::process::id()));
+        let status = Command::new("tar")
+            .arg("-cf")
+            .arg(&temporary)
+            .arg("-C")
+            .arg(&recipe.working_dir)
+            .args(recipe.outputs)
+            .status()
+            .with_context(|| format!("cache artifact for {}", recipe.id))?;
+        if !status.success() {
+            let _ = fs::remove_file(&temporary);
+            bail!("cache artifact for {} failed", recipe.id);
+        }
+        let hash = hash_file(&temporary)?;
+        let object = objects.join(format!("{hash}.tar"));
+        if object.exists() {
+            fs::remove_file(&temporary)?;
+        } else {
+            fs::rename(&temporary, &object)?;
+        }
+        let pointer = inputs.join(fingerprint);
+        let pointer_temporary = pointer.with_extension(format!("partial-{}", std::process::id()));
+        fs::write(&pointer_temporary, format!("{hash}\n"))?;
+        fs::rename(pointer_temporary, pointer)?;
+        Ok(())
     }
 
     fn save(&self) -> Result<()> {
@@ -215,6 +335,20 @@ impl Hydrator {
     }
 }
 
+fn hash_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn detect_recipes(repo: &Path) -> Result<Vec<Recipe>> {
     let classifier = Classifier::load(repo)?;
     let mut recipes = Vec::new();
@@ -231,49 +365,63 @@ fn detect_recipes(repo: &Path) -> Result<Vec<Recipe>> {
         let Some(parent) = entry.path().parent() else {
             continue;
         };
-        let (kind, program, args, manifest) = match entry.file_name().to_str() {
-            Some("package-lock.json") if parent.join("package.json").is_file() => {
-                ("npm", "npm", &["ci"][..], parent.join("package.json"))
-            }
+        let (kind, program, args, manifest, outputs) = match entry.file_name().to_str() {
+            Some("package-lock.json") if parent.join("package.json").is_file() => (
+                "npm",
+                "npm",
+                &["ci"][..],
+                parent.join("package.json"),
+                &["node_modules"][..],
+            ),
             Some("uv.lock") if parent.join("pyproject.toml").is_file() => (
                 "uv",
                 "uv",
                 &["sync", "--frozen"][..],
                 parent.join("pyproject.toml"),
+                &[".venv"][..],
             ),
             Some("pnpm-lock.yaml") if parent.join("package.json").is_file() => (
                 "pnpm",
                 "pnpm",
                 &["install", "--frozen-lockfile"][..],
                 parent.join("package.json"),
+                &["node_modules"][..],
             ),
             Some("yarn.lock") if parent.join("package.json").is_file() => (
                 "yarn",
                 "yarn",
                 &["install", "--frozen-lockfile"][..],
                 parent.join("package.json"),
+                &["node_modules"][..],
             ),
             Some("bun.lock" | "bun.lockb") if parent.join("package.json").is_file() => (
                 "bun",
                 "bun",
                 &["install", "--frozen-lockfile"][..],
                 parent.join("package.json"),
+                &["node_modules"][..],
             ),
             Some("poetry.lock") if parent.join("pyproject.toml").is_file() => (
                 "poetry",
                 "poetry",
                 &["install", "--no-interaction"][..],
                 parent.join("pyproject.toml"),
+                &[".venv"][..],
             ),
             Some("Cargo.lock") if parent.join("Cargo.toml").is_file() => (
                 "cargo",
                 "cargo",
                 &["fetch", "--locked"][..],
                 parent.join("Cargo.toml"),
+                &[][..],
             ),
-            Some("go.sum") if parent.join("go.mod").is_file() => {
-                ("go", "go", &["mod", "download"][..], parent.join("go.mod"))
-            }
+            Some("go.sum") if parent.join("go.mod").is_file() => (
+                "go",
+                "go",
+                &["mod", "download"][..],
+                parent.join("go.mod"),
+                &[][..],
+            ),
             _ => continue,
         };
         let relative = parent.strip_prefix(repo)?;
@@ -288,6 +436,7 @@ fn detect_recipes(repo: &Path) -> Result<Vec<Recipe>> {
             args,
             working_dir: parent.to_owned(),
             inputs: vec![manifest, entry.path().to_owned()],
+            outputs,
         });
     }
     recipes.sort_by(|left, right| left.id.cmp(&right.id));
@@ -435,5 +584,49 @@ mod tests {
 
         assert_eq!(forced.ran, ["npm:."]);
         assert!(forced.skipped.is_empty());
+    }
+
+    #[test]
+    fn verified_platform_cache_restores_missing_derived_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        write(&root.path().join("package.json"), "{}");
+        write(&root.path().join("package-lock.json"), "{}");
+        let mut hydrator =
+            Hydrator::open_with_state(root.path(), root.path().join("state/state.json")).unwrap();
+        hydrator.artifact_root = root.path().join("artifact-cache");
+
+        let first = hydrator
+            .run_changed_with_cache(false, true, |recipe| {
+                write(
+                    &recipe.working_dir().join("node_modules/pkg/index.js"),
+                    "cached output",
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.ran, ["npm:."]);
+        fs::remove_dir_all(root.path().join("node_modules")).unwrap();
+
+        let restored = hydrator
+            .run_changed_with_cache(false, true, |_| bail!("recipe should not run"))
+            .unwrap();
+        assert_eq!(restored.restored, ["npm:."]);
+        assert_eq!(
+            fs::read_to_string(root.path().join("node_modules/pkg/index.js")).unwrap(),
+            "cached output"
+        );
+
+        fs::remove_dir_all(root.path().join("node_modules")).unwrap();
+        let object = fs::read_dir(root.path().join("artifact-cache/objects"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(object, "tampered").unwrap();
+        let error = hydrator
+            .run_changed_with_cache(false, true, |_| bail!("recipe should not run"))
+            .unwrap_err();
+        assert!(error.to_string().contains("failed verification"));
     }
 }
