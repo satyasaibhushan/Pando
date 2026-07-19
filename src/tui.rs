@@ -58,8 +58,9 @@ fn run_loop(
                         .map(|time| format!("{}ms", now.saturating_sub(time)))
                         .unwrap_or_else(|| "never".into());
                     format!(
-                        "repo       {repo_id}\nlease      {lease}\nhead       {head}\nsnapshot   {age} ago\nexposure   {} bytes",
-                        status.exposure_bytes
+                        "repo       {repo_id}\nlease      {lease}\nhead       {head}\nsnapshot   {age} ago\nexposure   {} bytes\nforks      {}",
+                        status.exposure_bytes,
+                        status.forks.iter().map(|fork| short_id(fork)).collect::<Vec<_>>().join(", ")
                     )
                 }
                 Err(error) => format!("authority unavailable\n\n{error:#}"),

@@ -118,6 +118,29 @@ Pando invokes only these known executables directly—never through a shell—an
 
 Rehydration is opt-in because package managers can access the network and may execute lifecycle scripts or build hooks from the repository and its dependencies. Enable it only for repositories you trust.
 
+## Reconciling forks
+
+When two trunks change the same path from their last shared snapshot, Pando leaves the active authority head untouched and preserves the local tree as a pending fork. List pending forks with the same trunk arguments used by `push`:
+
+```sh
+pando reconcile \
+  --repo ~/Code/project \
+  --repo-id project \
+  --trunk-id macbook \
+  --authority tcp://linuxbox.local:7337 \
+  --key "$PANDO_KEY"
+```
+
+Resolve one explicitly:
+
+```sh
+pando reconcile <trunk arguments> --fork <snapshot-id> --choice authority
+pando reconcile <trunk arguments> --fork <snapshot-id> --choice fork
+pando reconcile <trunk arguments> --fork <snapshot-id> --choice manual
+```
+
+`authority` materializes the current authority tree. `fork` publishes the preserved fork as a new child of the current head. `manual` publishes the tree currently on disk after you resolve it yourself. The first two choices refuse if the working tree changed after the fork; this prevents a selection from silently erasing newer edits. Status and the TUI show the number and IDs of pending forks.
+
 ## Safety model
 
 - Chunks and manifests are immutable and content-addressed.

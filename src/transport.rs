@@ -170,6 +170,10 @@ enum Request {
     Forks {
         repo_id: String,
     },
+    ResolveFork {
+        repo_id: String,
+        snapshot_id: String,
+    },
     Head {
         repo_id: String,
     },
@@ -311,6 +315,13 @@ impl Authority for RemoteAuthority {
         }
     }
 
+    fn resolve_fork(&mut self, repo_id: &str, snapshot_id: &str) -> Result<()> {
+        expect_ok(self.rpc(Request::ResolveFork {
+            repo_id: repo_id.into(),
+            snapshot_id: snapshot_id.into(),
+        })?)
+    }
+
     fn head(&self, repo_id: &str) -> Result<Option<SnapshotId>> {
         match self.rpc(Request::Head {
             repo_id: repo_id.into(),
@@ -419,6 +430,13 @@ fn dispatch(request: Request, authority: &Arc<Mutex<FileAuthority>>) -> Response
                 Response::Ok
             }
             Request::Forks { repo_id } => Response::Forks(authority.forks(&repo_id)?),
+            Request::ResolveFork {
+                repo_id,
+                snapshot_id,
+            } => {
+                authority.resolve_fork(&repo_id, &snapshot_id)?;
+                Response::Ok
+            }
             Request::Head { repo_id } => Response::Head(authority.head(&repo_id)?),
             Request::Overlay { snapshot_id } => Response::Overlay(authority.overlay(&snapshot_id)?),
             Request::Status { repo_id, now_ms } => {

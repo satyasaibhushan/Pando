@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use pando::authority::{Authority, FileAuthority};
 use pando::classify::Classifier;
 use pando::clock::SystemClock;
 use pando::daemon::{WatchOptions, describe_pull, describe_push};
 use pando::rehydrate::Hydrator;
-use pando::sync::Trunk;
+use pando::sync::{ReconcileChoice, Trunk};
 use pando::transport::{RemoteAuthority, TransportKey};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -34,6 +34,14 @@ enum Command {
     },
     Push(TrunkArgs),
     Pull(TrunkArgs),
+    Reconcile {
+        #[command(flatten)]
+        trunk: TrunkArgs,
+        #[arg(long)]
+        fork: Option<String>,
+        #[arg(long, value_enum, requires = "fork")]
+        choice: Option<CliReconcileChoice>,
+    },
     Hydrate {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -107,6 +115,13 @@ struct TrunkArgs {
     key: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliReconcileChoice {
+    Authority,
+    Fork,
+    Manual,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Keygen { output } => {
@@ -141,6 +156,42 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 describe_pull(&trunk.pull(authority.as_ref(), &SystemClock)?)
+            );
+            Ok(())
+        }
+        Command::Reconcile {
+            trunk,
+            fork,
+            choice,
+        } => {
+            let mut authority = authority(&trunk.authority, trunk.key.as_deref())?;
+            let Some(fork) = fork else {
+                let forks = authority.forks(&trunk.repo_id)?;
+                if forks.is_empty() {
+                    println!("no pending forks");
+                }
+                for fork in forks {
+                    let overlay = authority.overlay(&fork)?;
+                    println!(
+                        "{} parent={} trunk={} created_at_ms={}",
+                        fork,
+                        overlay.snapshot.parent.as_deref().unwrap_or("none"),
+                        overlay.snapshot.trunk_id,
+                        overlay.snapshot.created_at_ms
+                    );
+                }
+                return Ok(());
+            };
+            let choice = match choice.context("--choice is required with --fork")? {
+                CliReconcileChoice::Authority => ReconcileChoice::Authority,
+                CliReconcileChoice::Fork => ReconcileChoice::Fork,
+                CliReconcileChoice::Manual => ReconcileChoice::Manual,
+            };
+            let result =
+                open_trunk(&trunk)?.reconcile(authority.as_mut(), &SystemClock, &fork, choice)?;
+            println!(
+                "resolved fork {} at head {}",
+                result.resolved_fork, result.head
             );
             Ok(())
         }
@@ -233,6 +284,7 @@ fn main() -> Result<()> {
             );
             println!("head: {}", status.head.unwrap_or_else(|| "none".into()));
             println!("exposure: {} bytes", status.exposure_bytes);
+            println!("forks: {}", status.forks.len());
             Ok(())
         }
         Command::Tui {

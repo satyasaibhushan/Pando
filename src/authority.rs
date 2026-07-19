@@ -22,6 +22,8 @@ pub struct AuthorityStatus {
     pub head: Option<SnapshotId>,
     pub last_snapshot_at_ms: Option<u64>,
     pub exposure_bytes: u64,
+    #[serde(default)]
+    pub forks: Vec<SnapshotId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub trait Authority {
     fn publish(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()>;
     fn publish_fork(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()>;
     fn forks(&self, repo_id: &str) -> Result<Vec<SnapshotId>>;
+    fn resolve_fork(&mut self, repo_id: &str, snapshot_id: &str) -> Result<()>;
     fn head(&self, repo_id: &str) -> Result<Option<SnapshotId>>;
     fn overlay(&self, snapshot_id: &str) -> Result<Overlay>;
     fn status(&self, repo_id: &str, now_ms: u64) -> Result<AuthorityStatus>;
@@ -477,6 +480,17 @@ impl Authority for FileAuthority {
             .unwrap_or_default())
     }
 
+    fn resolve_fork(&mut self, repo_id: &str, snapshot_id: &str) -> Result<()> {
+        let mut state = self.load_state()?;
+        let forks = state.forks.entry(repo_id.to_owned()).or_default();
+        let before = forks.len();
+        forks.retain(|fork| fork != snapshot_id);
+        if forks.len() == before {
+            bail!("snapshot {snapshot_id} is not a pending fork for {repo_id}");
+        }
+        self.save_state(&state)
+    }
+
     fn head(&self, repo_id: &str) -> Result<Option<SnapshotId>> {
         Ok(self.load_state()?.heads.get(repo_id).cloned())
     }
@@ -517,6 +531,7 @@ impl Authority for FileAuthority {
             head,
             last_snapshot_at_ms: overlay.as_ref().map(|value| value.snapshot.created_at_ms),
             exposure_bytes: overlay.as_ref().map(Overlay::bytes).unwrap_or(0),
+            forks: state.forks.get(repo_id).cloned().unwrap_or_default(),
         })
     }
 }

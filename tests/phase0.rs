@@ -65,6 +65,25 @@ impl Harness {
     }
 }
 
+fn create_overlapping_fork(harness: &Harness, authority: &mut FileAuthority) -> (Trunk, String) {
+    let first = harness.first();
+    let second = harness.second();
+    fs::write(harness.first_path.join("shared.txt"), "base\n").unwrap();
+    first.push(authority, &harness.clock).unwrap();
+    first.release(authority).unwrap();
+    second.pull(authority, &harness.clock).unwrap();
+    harness.clock.advance(1_000);
+    fs::write(harness.first_path.join("shared.txt"), "authority\n").unwrap();
+    first.push(authority, &harness.clock).unwrap();
+    first.release(authority).unwrap();
+    fs::write(harness.second_path.join("shared.txt"), "fork\n").unwrap();
+    let fork = match second.push(authority, &harness.clock).unwrap() {
+        PushResult::Conflicted { fork, .. } => fork,
+        result => panic!("unexpected push result: {result:?}"),
+    };
+    (second, fork)
+}
+
 #[test]
 fn dirty_tree_moves_between_two_trunks() {
     let harness = Harness::plain();
@@ -537,6 +556,99 @@ fn stale_overlapping_edits_report_paths_without_overwriting_local_work() {
         fs::read_to_string(harness.second_path.join("shared.txt")).unwrap(),
         "second\n"
     );
+}
+
+#[test]
+fn reconciliation_can_keep_the_authority_tree() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let (second, fork) = create_overlapping_fork(&harness, &mut authority);
+
+    second
+        .reconcile(
+            &mut authority,
+            &harness.clock,
+            &fork,
+            pando::sync::ReconcileChoice::Authority,
+        )
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("shared.txt")).unwrap(),
+        "authority\n"
+    );
+    assert!(authority.forks("repo").unwrap().is_empty());
+}
+
+#[test]
+fn reconciliation_can_promote_the_fork_tree() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let (second, fork) = create_overlapping_fork(&harness, &mut authority);
+
+    let result = second
+        .reconcile(
+            &mut authority,
+            &harness.clock,
+            &fork,
+            pando::sync::ReconcileChoice::Fork,
+        )
+        .unwrap();
+
+    assert_eq!(authority.head("repo").unwrap(), Some(result.head));
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("shared.txt")).unwrap(),
+        "fork\n"
+    );
+    assert!(authority.forks("repo").unwrap().is_empty());
+}
+
+#[test]
+fn reconciliation_can_publish_a_manually_edited_tree() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let (second, fork) = create_overlapping_fork(&harness, &mut authority);
+    fs::write(harness.second_path.join("shared.txt"), "manual merge\n").unwrap();
+
+    second
+        .reconcile(
+            &mut authority,
+            &harness.clock,
+            &fork,
+            pando::sync::ReconcileChoice::Manual,
+        )
+        .unwrap();
+
+    let head = authority.head("repo").unwrap().unwrap();
+    let overlay = authority.overlay(&head).unwrap();
+    let chunk = &overlay.snapshot.files["shared.txt"].chunk;
+    assert_eq!(authority.get_chunk(chunk).unwrap(), b"manual merge\n");
+    assert!(authority.forks("repo").unwrap().is_empty());
+}
+
+#[test]
+fn reconciliation_refuses_to_overwrite_edits_made_after_the_fork() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let (second, fork) = create_overlapping_fork(&harness, &mut authority);
+    fs::write(harness.second_path.join("shared.txt"), "newer edit\n").unwrap();
+
+    let error = second
+        .reconcile(
+            &mut authority,
+            &harness.clock,
+            &fork,
+            pando::sync::ReconcileChoice::Authority,
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("working tree changed after fork"), "{error}");
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("shared.txt")).unwrap(),
+        "newer edit\n"
+    );
+    assert_eq!(authority.forks("repo").unwrap(), [fork]);
 }
 
 #[test]

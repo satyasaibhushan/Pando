@@ -3,7 +3,8 @@ use crate::classify::{ClassificationPolicy, Classifier};
 use crate::clock::Clock;
 use crate::model::SnapshotId;
 use crate::snapshot::{
-    capture, capture_with_policy, materialization_delta, materialize_overlay, overlay_against,
+    capture, capture_with_policy, manifest_id, materialization_delta, materialize_overlay,
+    overlay_against,
 };
 use crate::store::ChunkStore;
 use anyhow::{Context, Result};
@@ -55,6 +56,19 @@ pub enum PullResult {
         local_head: Option<SnapshotId>,
         authority_head: SnapshotId,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconcileChoice {
+    Authority,
+    Fork,
+    Manual,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconcileResult {
+    pub resolved_fork: SnapshotId,
+    pub head: SnapshotId,
 }
 
 #[derive(Clone, Debug)]
@@ -326,6 +340,106 @@ impl Trunk {
         authority.release(&self.repo_id, &self.trunk_id)
     }
 
+    pub fn reconcile<A: Authority + ?Sized, C: Clock>(
+        &self,
+        authority: &mut A,
+        clock: &C,
+        fork_id: &str,
+        choice: ReconcileChoice,
+    ) -> Result<ReconcileResult> {
+        if !authority
+            .forks(&self.repo_id)?
+            .iter()
+            .any(|fork| fork == fork_id)
+        {
+            anyhow::bail!(
+                "snapshot {fork_id} is not a pending fork for {}",
+                self.repo_id
+            );
+        }
+        let fork = authority.overlay(fork_id)?;
+        let authority_head = authority
+            .head(&self.repo_id)?
+            .context("authority has no active head")?;
+        let mut state = self.load_state()?;
+        let current = capture_with_policy(
+            &self.repo,
+            &self.repo_id,
+            &self.trunk_id,
+            state.head.clone(),
+            clock.now_ms(),
+            &self.chunks,
+            ClassificationPolicy {
+                version: fork.snapshot.classification_version,
+                patterns: fork.snapshot.ignore_patterns.clone(),
+            },
+        )?;
+        if choice != ReconcileChoice::Manual && current.files != fork.snapshot.files {
+            anyhow::bail!(
+                "working tree changed after fork {}; use manual resolution to publish it",
+                fork_id
+            );
+        }
+
+        if choice == ReconcileChoice::Authority {
+            let target = authority.overlay(&authority_head)?;
+            self.materialize_from_authority(authority, &target, &current.files)?;
+            state.head = Some(authority_head.clone());
+            self.save_state(&state)?;
+            authority.resolve_fork(&self.repo_id, fork_id)?;
+            return Ok(ReconcileResult {
+                resolved_fork: fork_id.into(),
+                head: authority_head,
+            });
+        }
+
+        match authority.acquire(
+            &self.repo_id,
+            &self.trunk_id,
+            clock.now_ms(),
+            DEFAULT_LEASE_TTL_MS,
+        )? {
+            AcquireResult::HeldBy(lease) => {
+                anyhow::bail!("write lease is held by {}", lease.holder)
+            }
+            AcquireResult::Acquired(_) => {}
+        }
+        let result = (|| -> Result<ReconcileResult> {
+            if authority.head(&self.repo_id)?.as_deref() != Some(&authority_head) {
+                anyhow::bail!("authority head changed during reconciliation");
+            }
+            let mut manifest = if choice == ReconcileChoice::Fork {
+                fork.snapshot.clone()
+            } else {
+                current.clone()
+            };
+            manifest.id.clear();
+            manifest.trunk_id = self.trunk_id.clone();
+            manifest.created_at_ms = clock.now_ms();
+            manifest.parent = Some(authority_head);
+            manifest.id = manifest_id(&manifest)?;
+            let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
+            for entry in overlay.snapshot.files.values() {
+                if !authority.has_chunk(&entry.chunk)? {
+                    authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+                }
+            }
+            authority.publish(&overlay, &self.trunk_id, clock.now_ms())?;
+            if choice == ReconcileChoice::Fork {
+                self.materialize_from_authority(authority, &overlay, &current.files)?;
+            }
+            state.head = Some(overlay.snapshot.id.clone());
+            self.save_state(&state)?;
+            authority.resolve_fork(&self.repo_id, fork_id)?;
+            Ok(ReconcileResult {
+                resolved_fork: fork_id.into(),
+                head: overlay.snapshot.id,
+            })
+        })();
+        let _ = authority.release(&self.repo_id, &self.trunk_id);
+        result
+    }
+
     pub fn local_head(&self) -> Result<Option<SnapshotId>> {
         Ok(self.load_state()?.head)
     }
@@ -385,6 +499,22 @@ impl Trunk {
         };
         baseline.retain(|path, _| classifier.is_portable(Path::new(path), false));
         Ok(current_files == baseline)
+    }
+
+    fn materialize_from_authority<A: Authority + ?Sized>(
+        &self,
+        authority: &A,
+        target: &crate::model::Overlay,
+        current: &BTreeMap<String, crate::model::FileEntry>,
+    ) -> Result<()> {
+        let delta = materialization_delta(&self.repo, target, current)?;
+        for entry in delta.upserts.values() {
+            if !self.chunks.contains(&entry.chunk) {
+                let bytes = authority.get_chunk(&entry.chunk)?;
+                self.chunks.put_verified(&entry.chunk, &bytes)?;
+            }
+        }
+        materialize_overlay(&self.repo, &delta, &self.chunks)
     }
 }
 
