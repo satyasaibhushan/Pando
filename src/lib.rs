@@ -13,7 +13,9 @@ pub mod sync;
 pub mod transport;
 pub mod tui;
 
-pub use authority::{AcquireResult, Authority, AuthorityStatus, FileAuthority};
+pub use authority::{
+    AcquireResult, Authority, AuthorityStatus, FileAuthority, GarbageCollectionReport,
+};
 pub use clock::{Clock, SystemClock, VirtualClock};
 pub use model::{ChunkHash, FileEntry, FileKind, Lease, Manifest, Overlay, SnapshotId};
 pub use snapshot::{capture, materialization_delta, materialize_overlay, overlay_against};

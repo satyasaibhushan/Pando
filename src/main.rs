@@ -71,6 +71,12 @@ enum Command {
         #[arg(long, default_value = ".pando-authority")]
         data: PathBuf,
     },
+    Gc {
+        #[arg(long, default_value = ".pando-authority")]
+        data: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
     Restore {
         #[arg(long, default_value = ".pando-authority")]
         data: PathBuf,
@@ -461,6 +467,24 @@ fn main() -> Result<()> {
                 "verified {} heads, {} snapshots, {} chunks ({} bytes)",
                 report.heads, report.overlays, report.chunks, report.bytes
             );
+            Ok(())
+        }
+        Command::Gc { data, apply } => {
+            let report = FileAuthority::open_existing(&data)?.garbage_collect(apply)?;
+            println!(
+                "{} {} unreachable snapshots and {} chunks ({} bytes)",
+                if report.applied {
+                    "collected"
+                } else {
+                    "would collect"
+                },
+                report.overlays,
+                report.chunks,
+                report.bytes
+            );
+            if !report.applied {
+                println!("dry run only; pass --apply after stopping the authority service");
+            }
             Ok(())
         }
         Command::Restore {

@@ -177,6 +177,8 @@ pando verify --data ~/.local/share/pando/authority
 
 The audit rehashes every stored chunk, recomputes every snapshot ID, validates overlay shape and byte lengths, walks parent chains, and checks that every repository head resolves to a snapshot for that repository. For the cleanest point-in-time result, run it while the authority is idle; a concurrent publication can produce a transient mismatch that is safe to retry.
 
+Preview storage reclamation with `pando gc --data ~/.local/share/pando/authority`. It verifies the store, then reports snapshots unreachable from every head or pending fork and chunks used only by those snapshots. Stop the authority service and pass `--apply` to delete exactly that unreachable set; retained head/fork ancestry remains restorable and is verified again afterward.
+
 Restore any retained snapshot into a new path:
 
 ```sh

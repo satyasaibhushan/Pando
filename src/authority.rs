@@ -41,6 +41,14 @@ pub struct RestoreReport {
     pub bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GarbageCollectionReport {
+    pub overlays: usize,
+    pub chunks: usize,
+    pub bytes: u64,
+    pub applied: bool,
+}
+
 pub trait Authority {
     fn acquire(
         &mut self,
@@ -250,6 +258,81 @@ impl FileAuthority {
                 .values()
                 .map(|entry| entry.size)
                 .sum(),
+        })
+    }
+
+    pub fn garbage_collect(&self, apply: bool) -> Result<GarbageCollectionReport> {
+        self.verify()
+            .context("refuse to collect an invalid authority")?;
+        let state = self.load_state()?;
+        let mut overlays = BTreeMap::new();
+        for entry in fs::read_dir(self.root.join("overlays"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            {
+                let overlay: Overlay = serde_json::from_slice(&fs::read(entry.path())?)?;
+                overlays.insert(overlay.snapshot.id.clone(), overlay);
+            }
+        }
+
+        let mut reachable = BTreeSet::new();
+        let mut pending: Vec<_> = state
+            .heads
+            .values()
+            .chain(state.forks.values().flatten())
+            .cloned()
+            .collect();
+        while let Some(snapshot) = pending.pop() {
+            if !reachable.insert(snapshot.clone()) {
+                continue;
+            }
+            if let Some(parent) = overlays
+                .get(&snapshot)
+                .and_then(|overlay| overlay.snapshot.parent.clone())
+            {
+                pending.push(parent);
+            }
+        }
+
+        let unreachable: Vec<_> = overlays
+            .keys()
+            .filter(|snapshot| !reachable.contains(*snapshot))
+            .cloned()
+            .collect();
+        let retained_chunks: BTreeSet<_> = overlays
+            .iter()
+            .filter(|(snapshot, _)| reachable.contains(*snapshot))
+            .flat_map(|(_, overlay)| {
+                overlay
+                    .snapshot
+                    .files
+                    .values()
+                    .map(|entry| entry.chunk.clone())
+            })
+            .collect();
+        let inventory = self.chunks.inventory()?;
+        let unreferenced: Vec<_> = inventory
+            .iter()
+            .filter(|(hash, _)| !retained_chunks.contains(*hash))
+            .map(|(hash, bytes)| (hash.clone(), *bytes))
+            .collect();
+        let bytes = unreferenced.iter().map(|(_, bytes)| bytes).sum();
+
+        if apply {
+            for snapshot in &unreachable {
+                fs::remove_file(self.overlay_path(snapshot))?;
+            }
+            for (hash, _) in &unreferenced {
+                self.chunks.remove(hash)?;
+            }
+            self.verify().context("verify authority after collection")?;
+        }
+        Ok(GarbageCollectionReport {
+            overlays: unreachable.len(),
+            chunks: unreferenced.len(),
+            bytes,
+            applied: apply,
         })
     }
 

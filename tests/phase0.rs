@@ -1534,6 +1534,29 @@ fn materialization_refuses_case_colliding_snapshot_paths() {
     assert!(!destination.exists());
 }
 
+#[test]
+fn authority_gc_reclaims_only_resolved_forks_and_orphan_chunks() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let (_trunk, fork) = create_overlapping_fork(&harness, &mut authority);
+    authority.resolve_fork("repo", &fork).unwrap();
+    let head = authority.head("repo").unwrap().unwrap();
+
+    let preview = authority.garbage_collect(false).unwrap();
+    assert!(!preview.applied);
+    assert_eq!(preview.overlays, 1);
+    assert!(preview.chunks >= 1);
+    assert!(authority.overlay(&fork).is_ok());
+
+    let applied = authority.garbage_collect(true).unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.overlays, preview.overlays);
+    assert_eq!(applied.chunks, preview.chunks);
+    assert!(authority.overlay(&fork).is_err());
+    assert!(authority.overlay(&head).is_ok());
+    authority.verify().unwrap();
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")

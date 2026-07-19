@@ -1,5 +1,6 @@
 use crate::model::ChunkHash;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -126,6 +127,49 @@ impl ChunkStore {
             bytes += contents.len() as u64;
         }
         Ok(StoreVerification { chunks, bytes })
+    }
+
+    pub(crate) fn inventory(&self) -> Result<BTreeMap<ChunkHash, u64>> {
+        let mut chunks = BTreeMap::new();
+        for prefix in fs::read_dir(&self.root)? {
+            let prefix = prefix?;
+            if !prefix.file_type()?.is_dir() || !valid_hex_component(&prefix.file_name(), 2) {
+                continue;
+            }
+            let Some(prefix_name) = prefix.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            for suffix in fs::read_dir(prefix.path())? {
+                let suffix = suffix?;
+                let Some(suffix_name) = suffix.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if suffix.file_type()?.is_file() && valid_hex(suffix_name.as_bytes(), 62) {
+                    chunks.insert(
+                        format!("{prefix_name}{suffix_name}"),
+                        suffix.metadata()?.len(),
+                    );
+                }
+            }
+        }
+        Ok(chunks)
+    }
+
+    pub(crate) fn remove(&self, hash: &str) -> Result<()> {
+        if !valid_hex(hash.as_bytes(), 64) {
+            bail!("invalid chunk hash {hash:?}");
+        }
+        let path = self.path(hash);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::remove_dir(parent);
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn path(&self, hash: &str) -> PathBuf {
