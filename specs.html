@@ -421,7 +421,8 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
     </div>
     <div class="gate"><b>Gate</b>The retention test: after a month, can I tolerate going back to plain git-push discipline or remote-dev? Physically refusing to churn = strongest possible signal. Only then does Phase 2 exist.</div>
     <ul class="tasks">
-      <li><label><input type="checkbox" data-id="p1-1"><span><span class="sub">conflict</span>Fork-and-merge: DAG branching on offline divergence, three-way auto-merge when non-overlapping, reconcile UI otherwise</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-1a" checked><span><span class="sub">conflict</span>Three-way auto-merge stale trunks with non-overlapping file changes; report exact conflicting paths without overwriting local work</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-1"><span><span class="sub">conflict</span>Persist overlapping offline forks in the snapshot DAG + reconcile command/TUI</span></label></li>
       <li><label><input type="checkbox" data-id="p1-2a" checked><span><span class="sub">classify</span>Versioned portable/derived/local classifier + conservative built-ins + snapshot-carried <code>.pandoignore</code>; ignored receiver state is never deleted</span></label></li>
       <li><label><input type="checkbox" data-id="p1-2" checked><span><span class="sub">classify</span>User-wide classification rules + <code>pando classify</code> winning-rule explanations and diagnostics</span></label></li>
       <li><label><input type="checkbox" data-id="p1-3a" checked><span><span class="sub">rehydrate</span>Opt-in npm/uv recipe runner: root + nested detection, direct no-shell execution after materialization, successful-input fingerprint cache, failure retry, and classified watcher events</span></label></li>

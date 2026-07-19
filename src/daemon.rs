@@ -98,7 +98,9 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
                 Ok(result) => {
                     lease_released = matches!(
                         result,
-                        PushResult::LeaseHeld { .. } | PushResult::Diverged { .. }
+                        PushResult::LeaseHeld { .. }
+                            | PushResult::Diverged { .. }
+                            | PushResult::Conflicted { .. }
                     );
                     println!("{}", describe_push(&result));
                     if matches!(result, PushResult::NoChanges { .. }) {
@@ -154,6 +156,16 @@ pub fn describe_push(result: &PushResult) -> String {
             authority_head,
         } => format!(
             "write refused: local head {local_head:?} diverged from authority {authority_head:?}"
+        ),
+        PushResult::Conflicted {
+            local_head,
+            authority_head,
+            paths,
+        } => format!(
+            "reconcile required: local {} and authority {} both changed {}",
+            short_id(local_head),
+            short_id(authority_head),
+            paths.join(", ")
         ),
     }
 }

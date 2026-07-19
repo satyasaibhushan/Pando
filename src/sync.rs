@@ -8,6 +8,7 @@ use crate::snapshot::{
 use crate::store::ChunkStore;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,11 @@ pub enum PushResult {
     Diverged {
         local_head: Option<SnapshotId>,
         authority_head: Option<SnapshotId>,
+    },
+    Conflicted {
+        local_head: SnapshotId,
+        authority_head: SnapshotId,
+        paths: Vec<String>,
     },
 }
 
@@ -123,10 +129,49 @@ impl Trunk {
             let mut state = self.load_state()?;
             let authority_head = authority.head(&self.repo_id)?;
             if authority_head != state.head {
-                return Ok(PushResult::Diverged {
-                    local_head: state.head,
-                    authority_head,
-                });
+                let (Some(local_head), Some(authority_head)) =
+                    (state.head.clone(), authority_head.clone())
+                else {
+                    return Ok(PushResult::Diverged {
+                        local_head: state.head,
+                        authority_head,
+                    });
+                };
+                let base = authority.overlay(&local_head)?;
+                let remote = authority.overlay(&authority_head)?;
+                let local = capture_with_policy(
+                    &self.repo,
+                    &self.repo_id,
+                    &self.trunk_id,
+                    Some(local_head.clone()),
+                    now_ms,
+                    &self.chunks,
+                    ClassificationPolicy {
+                        version: base.snapshot.classification_version,
+                        patterns: base.snapshot.ignore_patterns.clone(),
+                    },
+                )?;
+                let (merged, conflicts) =
+                    three_way_files(&base.snapshot.files, &local.files, &remote.snapshot.files);
+                if !conflicts.is_empty() {
+                    return Ok(PushResult::Conflicted {
+                        local_head,
+                        authority_head,
+                        paths: conflicts,
+                    });
+                }
+                let mut target = remote.clone();
+                target.snapshot.files = merged;
+                let delta = materialization_delta(&self.repo, &target, &local.files)?;
+                for entry in delta.upserts.values() {
+                    if !self.chunks.contains(&entry.chunk) {
+                        let bytes = authority.get_chunk(&entry.chunk)?;
+                        self.chunks.put_verified(&entry.chunk, &bytes)?;
+                    }
+                }
+                materialize_overlay(&self.repo, &delta, &self.chunks)?;
+                state.head = Some(authority_head);
+                self.save_state(&state)?;
             }
             let manifest = capture(
                 &self.repo,
@@ -170,7 +215,12 @@ impl Trunk {
                 exposure_bytes,
             })
         })();
-        if result.is_err() || matches!(&result, Ok(PushResult::Diverged { .. })) {
+        if result.is_err()
+            || matches!(
+                &result,
+                Ok(PushResult::Diverged { .. } | PushResult::Conflicted { .. })
+            )
+        {
             let _ = authority.release(&self.repo_id, &self.trunk_id);
         }
         result
@@ -327,6 +377,39 @@ impl Trunk {
         baseline.retain(|path, _| classifier.is_portable(Path::new(path), false));
         Ok(current_files == baseline)
     }
+}
+
+fn three_way_files(
+    base: &BTreeMap<String, crate::model::FileEntry>,
+    local: &BTreeMap<String, crate::model::FileEntry>,
+    remote: &BTreeMap<String, crate::model::FileEntry>,
+) -> (BTreeMap<String, crate::model::FileEntry>, Vec<String>) {
+    let paths: BTreeSet<_> = base
+        .keys()
+        .chain(local.keys())
+        .chain(remote.keys())
+        .collect();
+    let mut merged = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for path in paths {
+        let base_entry = base.get(path);
+        let local_entry = local.get(path);
+        let remote_entry = remote.get(path);
+        let selected = if local_entry == remote_entry {
+            local_entry
+        } else if local_entry == base_entry {
+            remote_entry
+        } else if remote_entry == base_entry {
+            local_entry
+        } else {
+            conflicts.push(path.clone());
+            continue;
+        };
+        if let Some(entry) = selected {
+            merged.insert(path.clone(), entry.clone());
+        }
+    }
+    (merged, conflicts)
 }
 
 pub(crate) fn default_data_root() -> Result<PathBuf> {

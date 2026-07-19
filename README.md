@@ -124,6 +124,7 @@ Rehydration is opt-in because package managers can access the network and may ex
 - A manifest becomes visible only after all referenced chunks arrive.
 - Only the active lease holder can publish.
 - A stale trunk is refused even after the previous lease expires.
+- A stale trunk three-way merges non-overlapping edits against its last shared snapshot; overlapping paths are reported without overwriting local work.
 - Pull refuses to overwrite local edits.
 - Trunk bookkeeping lives outside the repository, so Git operations cannot stash, clean, or check it out.
 

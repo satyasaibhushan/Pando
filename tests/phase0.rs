@@ -472,6 +472,64 @@ fn expired_lease_still_refuses_a_stale_parent() {
 }
 
 #[test]
+fn stale_non_overlapping_edits_three_way_merge_and_publish() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    let second = harness.second();
+    fs::write(harness.first_path.join("left.txt"), "base\n").unwrap();
+    fs::write(harness.first_path.join("right.txt"), "base\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    harness.clock.advance(1_000);
+    fs::write(harness.first_path.join("left.txt"), "first\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    fs::write(harness.second_path.join("right.txt"), "second\n").unwrap();
+
+    let result = second.push(&mut authority, &harness.clock).unwrap();
+    assert!(matches!(result, PushResult::Published { .. }));
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("left.txt")).unwrap(),
+        "first\n"
+    );
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("right.txt")).unwrap(),
+        "second\n"
+    );
+}
+
+#[test]
+fn stale_overlapping_edits_report_paths_without_overwriting_local_work() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    let second = harness.second();
+    fs::write(harness.first_path.join("shared.txt"), "base\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    harness.clock.advance(1_000);
+    fs::write(harness.first_path.join("shared.txt"), "first\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    fs::write(harness.second_path.join("shared.txt"), "second\n").unwrap();
+
+    let result = second.push(&mut authority, &harness.clock).unwrap();
+    assert!(matches!(
+        result,
+        PushResult::Conflicted { paths, .. } if paths == ["shared.txt"]
+    ));
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("shared.txt")).unwrap(),
+        "second\n"
+    );
+}
+
+#[test]
 fn dirty_pull_is_refused_instead_of_overwritten() {
     let harness = Harness::plain();
     let mut authority = harness.authority();
