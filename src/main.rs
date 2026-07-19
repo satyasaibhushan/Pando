@@ -20,6 +20,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
+    Sync {
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+    },
+    Authority {
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+        #[arg(long, default_value = "0.0.0.0:7337")]
+        bind: String,
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
     Keygen {
         #[arg(long)]
         output: PathBuf,
@@ -104,24 +120,52 @@ enum Command {
         rehydrate: bool,
     },
     Status {
-        #[arg(long)]
-        repo_id: String,
-        #[arg(long)]
-        authority: String,
-        #[arg(long, env = "PANDO_KEY")]
-        key: Option<PathBuf>,
+        #[arg(default_value = ".")]
+        folder: PathBuf,
     },
     Tui {
-        #[arg(long)]
-        repo_id: String,
-        #[arg(long)]
-        authority: String,
-        #[arg(long, env = "PANDO_KEY")]
-        key: Option<PathBuf>,
+        #[arg(default_value = ".")]
+        folder: PathBuf,
     },
     Demo {
         #[arg(long, default_value = ".pando-demo")]
         root: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetupCommand {
+    Host {
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+        #[arg(long)]
+        authority: String,
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, default_value = "pando-invite.json")]
+        invite: PathBuf,
+        #[arg(long)]
+        no_sync: bool,
+    },
+    Join {
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+        #[arg(long)]
+        invite: PathBuf,
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        no_sync: bool,
+    },
+    Services {
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+        #[arg(long)]
+        activate: bool,
+        #[arg(long)]
+        rehydrate: bool,
     },
 }
 
@@ -219,6 +263,82 @@ impl From<CliServicePlatform> for pando::service::ServicePlatform {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Setup { command } => match command {
+            SetupCommand::Host {
+                folder,
+                authority,
+                device,
+                key,
+                invite,
+                no_sync,
+            } => {
+                let generated_key = key.is_none().then(|| {
+                    std::env::temp_dir().join(format!(
+                        "pando-setup-key-{}-{}.key",
+                        std::process::id(),
+                        pando::Clock::now_ms(&SystemClock)
+                    ))
+                });
+                let key_path = key.as_deref().or(generated_key.as_deref()).unwrap();
+                if generated_key.is_some() {
+                    TransportKey::generate(key_path)?;
+                }
+                let result = pando::config::create_host(
+                    &folder,
+                    &device.unwrap_or(default_device_name()),
+                    &authority,
+                    key_path,
+                    &invite,
+                );
+                if let Some(generated_key) = generated_key {
+                    let _ = fs::remove_file(generated_key);
+                }
+                let config = result?;
+                print_setup(&config);
+                println!("secret invitation: {}", invite.display());
+                if !no_sync {
+                    let mut authority = FileAuthority::open(config.authority_data_path())?;
+                    sync_config_with_authority(&config, &mut authority)?;
+                }
+                println!("next: pando authority {}", shell_hint(&config.root));
+                Ok(())
+            }
+            SetupCommand::Join {
+                folder,
+                invite,
+                device,
+                no_sync,
+            } => {
+                let config = pando::config::join(
+                    &folder,
+                    &device.unwrap_or(default_device_name()),
+                    &invite,
+                )?;
+                print_setup(&config);
+                if !no_sync {
+                    sync_config(&config)?;
+                }
+                println!("next: pando tui {}", shell_hint(&config.root));
+                Ok(())
+            }
+            SetupCommand::Services {
+                folder,
+                activate,
+                rehydrate,
+            } => install_configured_services(&pando::config::load(&folder)?, activate, rehydrate),
+        },
+        Command::Sync { folder } => sync_config(&pando::config::load(&folder)?),
+        Command::Authority { folder, bind, data } => {
+            let config = pando::config::load(&folder)?;
+            let data = data.unwrap_or_else(|| config.authority_data_path());
+            let key = TransportKey::load(&config.key_path)?;
+            println!(
+                "Pando authority listening securely on {bind}; data at {}; key {}",
+                data.display(),
+                key.fingerprint()
+            );
+            pando::transport::serve(&bind, FileAuthority::open(data)?, key)
+        }
         Command::Keygen { output } => {
             let key = TransportKey::generate(&output)?;
             println!(
@@ -538,32 +658,120 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Command::Status {
-            repo_id,
-            authority: endpoint,
-            key,
-        } => {
-            let authority = authority(&endpoint, key.as_deref())?;
-            let status = authority.status(&repo_id, pando::Clock::now_ms(&SystemClock))?;
-            println!("repo: {}", status.repo_id);
-            println!(
-                "lease: {}",
-                status
-                    .lease
-                    .map(|lease| lease.holder)
-                    .unwrap_or_else(|| "free".into())
-            );
-            println!("head: {}", status.head.unwrap_or_else(|| "none".into()));
-            println!("exposure: {} bytes", status.exposure_bytes);
-            println!("forks: {}", status.forks.len());
-            Ok(())
-        }
-        Command::Tui {
-            repo_id,
-            authority: endpoint,
-            key,
-        } => pando::tui::run(authority(&endpoint, key.as_deref())?, repo_id),
+        Command::Status { folder } => status_config(&pando::config::load(&folder)?),
+        Command::Tui { folder } => pando::tui::run(pando::config::load(&folder)?),
         Command::Demo { root } => demo(&root),
+    }
+}
+
+fn sync_config(config: &pando::config::DeviceConfig) -> Result<()> {
+    let mut authority = authority(&config.authority, Some(&config.key_path))?;
+    sync_config_with_authority(config, authority.as_mut())
+}
+
+fn sync_config_with_authority(
+    config: &pando::config::DeviceConfig,
+    authority: &mut dyn Authority,
+) -> Result<()> {
+    for workspace in &config.workspaces {
+        let path = config.workspace_path(workspace);
+        let trunk = Trunk::open(&path, &workspace.id, &config.device_id)?;
+        let result = trunk.push(authority, &SystemClock)?;
+        trunk.release(authority)?;
+        println!("{}: {}", workspace.name, describe_push(&result));
+    }
+    Ok(())
+}
+
+fn status_config(config: &pando::config::DeviceConfig) -> Result<()> {
+    let authority = authority(&config.authority, Some(&config.key_path))?;
+    println!(
+        "network {} · device {}",
+        &config.network_id[..12],
+        config.device_name
+    );
+    for workspace in &config.workspaces {
+        let status = authority.status(&workspace.id, pando::Clock::now_ms(&SystemClock))?;
+        let state = if status.forks.is_empty() {
+            "in sync".to_owned()
+        } else {
+            format!("needs decision ({})", status.forks.len())
+        };
+        println!("{}: {state}", workspace.name);
+    }
+    Ok(())
+}
+
+fn install_configured_services(
+    config: &pando::config::DeviceConfig,
+    activate: bool,
+    rehydrate: bool,
+) -> Result<()> {
+    let binary = std::env::current_exe()?.canonicalize()?;
+    let platform = pando::service::ServicePlatform::native()?;
+    for workspace in &config.workspaces {
+        let report = pando::service::install(
+            &pando::service::ServiceSpec {
+                binary: binary.clone(),
+                repo: config.workspace_path(workspace),
+                repo_id: workspace.id.clone(),
+                trunk_id: config.device_id.clone(),
+                authority: config.authority.clone(),
+                key: config.key_path.clone(),
+                quiescence_ms: 750,
+                idle_ms: 3_000,
+                full_scan_secs: 60,
+                fetch_secs: 30,
+                escape_secs: 600,
+                escape_remote: "origin".into(),
+                rehydrate,
+            },
+            platform,
+            None,
+            activate,
+        )?;
+        println!("{}: {}", workspace.name, report.path.display());
+    }
+    Ok(())
+}
+
+fn print_setup(config: &pando::config::DeviceConfig) {
+    println!(
+        "network {} · device {} · {} workspace(s)",
+        &config.network_id[..12],
+        config.device_name,
+        config.workspaces.len()
+    );
+    for workspace in &config.workspaces {
+        println!(
+            "  {}  {}",
+            workspace.name,
+            config.workspace_path(workspace).display()
+        );
+    }
+    println!("managed key: {}", config.key_path.display());
+}
+
+fn default_device_name() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "device".into())
+}
+
+fn shell_hint(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    if rendered.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+    }) {
+        rendered
+    } else {
+        format!("{:?}", rendered)
     }
 }
 

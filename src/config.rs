@@ -44,6 +44,13 @@ impl DeviceConfig {
             self.root.join(&workspace.relative_path)
         }
     }
+
+    pub fn authority_data_path(&self) -> PathBuf {
+        self.key_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("authority")
+    }
 }
 
 pub fn create_host(

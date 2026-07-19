@@ -71,6 +71,12 @@ pub struct ReconcileResult {
     pub head: SnapshotId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkConflict {
+    pub path: String,
+    pub authority_path: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Trunk {
     repo: PathBuf,
@@ -473,6 +479,111 @@ impl Trunk {
         result
     }
 
+    pub fn fork_conflicts<A: Authority + ?Sized>(
+        &self,
+        authority: &A,
+        fork_id: &str,
+    ) -> Result<Vec<ForkConflict>> {
+        let fork = authority.overlay(fork_id)?;
+        let head = authority
+            .head(&self.repo_id)?
+            .context("authority has no active head")?;
+        let current = authority.overlay(&head)?;
+        let base = self
+            .load_state()?
+            .head
+            .map(|head| {
+                authority
+                    .overlay(&head)
+                    .map(|overlay| overlay.snapshot.files)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let (_, conflicts) = three_way_files(&base, &fork.snapshot.files, &current.snapshot.files);
+        Ok(conflicts
+            .into_iter()
+            .map(|path| ForkConflict {
+                path,
+                authority_path: None,
+            })
+            .collect())
+    }
+
+    pub fn reconcile_keep_both<A: Authority + ?Sized, C: Clock>(
+        &self,
+        authority: &mut A,
+        clock: &C,
+        fork_id: &str,
+    ) -> Result<ReconcileResult> {
+        if !authority
+            .forks(&self.repo_id)?
+            .iter()
+            .any(|fork| fork == fork_id)
+        {
+            anyhow::bail!(
+                "snapshot {fork_id} is not a pending fork for {}",
+                self.repo_id
+            );
+        }
+        let fork = authority.overlay(fork_id)?;
+        let head = authority
+            .head(&self.repo_id)?
+            .context("authority has no active head")?;
+        let current_head = authority.overlay(&head)?;
+        let current = capture_with_policy(
+            &self.repo,
+            &self.repo_id,
+            &self.trunk_id,
+            self.load_state()?.head,
+            clock.now_ms(),
+            &self.chunks,
+            ClassificationPolicy {
+                version: fork.snapshot.classification_version,
+                patterns: fork.snapshot.ignore_patterns.clone(),
+            },
+        )?;
+        if current.files != fork.snapshot.files {
+            anyhow::bail!(
+                "working tree changed after fork {}; resolve it manually instead",
+                fork_id
+            );
+        }
+
+        let base = self
+            .load_state()?
+            .head
+            .map(|head| {
+                authority
+                    .overlay(&head)
+                    .map(|overlay| overlay.snapshot.files)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let (files, conflicts) =
+            three_way_files(&base, &fork.snapshot.files, &current_head.snapshot.files);
+        let mut merged = fork.snapshot.clone();
+        merged.files = files;
+        for path in conflicts {
+            if let Some(entry) = fork.snapshot.files.get(&path) {
+                merged.files.insert(path.clone(), entry.clone());
+            }
+            if let Some(entry) = current_head.snapshot.files.get(&path) {
+                let copy = conflict_copy_path(&path, &merged.files);
+                merged.files.insert(copy, entry.clone());
+            }
+        }
+        merged.id.clear();
+        merged.parent = Some(head);
+        merged.created_at_ms = clock.now_ms();
+        let target = crate::model::Overlay {
+            snapshot: merged,
+            upserts: current_head.snapshot.files,
+            deletes: Vec::new(),
+        };
+        self.materialize_from_authority(authority, &target, &current.files)?;
+        self.reconcile(authority, clock, fork_id, ReconcileChoice::Manual)
+    }
+
     pub fn local_head(&self) -> Result<Option<SnapshotId>> {
         Ok(self.load_state()?.head)
     }
@@ -616,6 +727,32 @@ impl Trunk {
         })();
         let _ = fs::remove_dir_all(&temporary);
         result
+    }
+}
+
+fn conflict_copy_path(path: &str, files: &BTreeMap<String, crate::model::FileEntry>) -> String {
+    let source = Path::new(path);
+    let parent = source.parent().filter(|path| !path.as_os_str().is_empty());
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let mut number = 1;
+    loop {
+        let suffix = if number == 1 {
+            ".pando-other".to_owned()
+        } else {
+            format!(".pando-other-{number}")
+        };
+        let candidate = parent
+            .map(|parent| parent.join(format!("{name}{suffix}")))
+            .unwrap_or_else(|| PathBuf::from(format!("{name}{suffix}")))
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !files.contains_key(&candidate) {
+            return candidate;
+        }
+        number += 1;
     }
 }
 

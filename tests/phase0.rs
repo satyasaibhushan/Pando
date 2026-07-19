@@ -521,7 +521,7 @@ fn trunk_bookkeeping_survives_stashing_all_untracked_files() {
 }
 
 #[test]
-fn expired_lease_still_refuses_a_stale_parent() {
+fn expired_lease_preserves_a_stale_first_join_as_a_fork() {
     let harness = Harness::plain();
     fs::write(harness.first_path.join("work.txt"), "first\n").unwrap();
     let mut authority = harness.authority();
@@ -538,11 +538,12 @@ fn expired_lease_still_refuses_a_stale_parent() {
         .unwrap();
     assert!(matches!(
         result,
-        PushResult::Diverged {
-            local_head: None,
-            authority_head: Some(_)
-        }
+        PushResult::Conflicted { paths, .. } if paths == ["work.txt"]
     ));
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("work.txt")).unwrap(),
+        "offline second\n"
+    );
     assert!(matches!(
         authority
             .acquire("repo", "macbook", harness.clock.now_ms(), 10)
@@ -685,6 +686,87 @@ fn reconciliation_can_publish_a_manually_edited_tree() {
     let chunk = &overlay.snapshot.files["shared.txt"].chunk;
     assert_eq!(authority.get_chunk(chunk).unwrap(), b"manual merge\n");
     assert!(authority.forks("repo").unwrap().is_empty());
+}
+
+#[test]
+fn reconciliation_can_keep_both_versions_as_separate_files() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let (second, fork) = create_overlapping_fork(&harness, &mut authority);
+
+    let conflicts = second.fork_conflicts(&authority, &fork).unwrap();
+    assert_eq!(
+        conflicts
+            .iter()
+            .map(|conflict| conflict.path.as_str())
+            .collect::<Vec<_>>(),
+        ["shared.txt"]
+    );
+    second
+        .reconcile_keep_both(&mut authority, &harness.clock, &fork)
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("shared.txt")).unwrap(),
+        "fork\n"
+    );
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("shared.txt.pando-other")).unwrap(),
+        "authority\n"
+    );
+    assert!(authority.forks("repo").unwrap().is_empty());
+}
+
+#[test]
+fn keep_both_still_auto_merges_non_overlapping_files() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    let second = harness.second();
+    fs::write(harness.first_path.join("shared.txt"), "base\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    harness.clock.advance(1_000);
+    fs::write(harness.first_path.join("shared.txt"), "authority\n").unwrap();
+    fs::write(harness.first_path.join("authority-only.txt"), "remote\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    fs::write(harness.second_path.join("shared.txt"), "fork\n").unwrap();
+    fs::write(harness.second_path.join("local-only.txt"), "local\n").unwrap();
+    let fork = match second.push(&mut authority, &harness.clock).unwrap() {
+        PushResult::Conflicted { fork, .. } => fork,
+        result => panic!("unexpected push result: {result:?}"),
+    };
+
+    assert_eq!(
+        second
+            .fork_conflicts(&authority, &fork)
+            .unwrap()
+            .into_iter()
+            .map(|conflict| conflict.path)
+            .collect::<Vec<_>>(),
+        ["shared.txt"]
+    );
+    second
+        .reconcile_keep_both(&mut authority, &harness.clock, &fork)
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("authority-only.txt")).unwrap(),
+        "remote\n"
+    );
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("local-only.txt")).unwrap(),
+        "local\n"
+    );
+    assert!(
+        !harness
+            .second_path
+            .join("authority-only.txt.pando-other")
+            .exists()
+    );
 }
 
 #[test]
