@@ -115,6 +115,66 @@ fn dirty_tree_moves_between_two_trunks() {
 }
 
 #[test]
+fn first_join_unions_disjoint_existing_folders_on_both_devices() {
+    let harness = Harness::plain();
+    fs::create_dir_all(harness.first_path.join("host-only")).unwrap();
+    fs::write(harness.first_path.join("host-only/work.txt"), "host\n").unwrap();
+    fs::create_dir_all(harness.second_path.join("client-only")).unwrap();
+    fs::write(
+        harness.second_path.join("client-only/notes.txt"),
+        "client\n",
+    )
+    .unwrap();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    let second = harness.second();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+
+    let joined = second.push(&mut authority, &harness.clock).unwrap();
+    assert!(matches!(joined, PushResult::Published { .. }));
+    second.release(&mut authority).unwrap();
+    first.pull(&authority, &harness.clock).unwrap();
+
+    for root in [&harness.first_path, &harness.second_path] {
+        assert_eq!(
+            fs::read_to_string(root.join("host-only/work.txt")).unwrap(),
+            "host\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("client-only/notes.txt")).unwrap(),
+            "client\n"
+        );
+    }
+}
+
+#[test]
+fn first_join_preserves_same_path_conflicts_as_a_pending_fork() {
+    let harness = Harness::plain();
+    fs::write(harness.first_path.join("same.txt"), "host\n").unwrap();
+    fs::write(harness.second_path.join("same.txt"), "client\n").unwrap();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    let second = harness.second();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+
+    let conflict = second.push(&mut authority, &harness.clock).unwrap();
+    let fork = match conflict {
+        PushResult::Conflicted { fork, paths, .. } => {
+            assert_eq!(paths, ["same.txt"]);
+            fork
+        }
+        result => panic!("unexpected join result: {result:?}"),
+    };
+    assert_eq!(authority.forks("repo").unwrap(), [fork]);
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("same.txt")).unwrap(),
+        "client\n"
+    );
+}
+
+#[test]
 fn authority_integrity_audit_verifies_history_and_detects_chunk_corruption() {
     let harness = Harness::plain();
     fs::write(harness.first_path.join("work.txt"), "integrity\n").unwrap();

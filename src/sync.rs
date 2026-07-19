@@ -144,52 +144,97 @@ impl Trunk {
             let mut state = self.load_state()?;
             let authority_head = authority.head(&self.repo_id)?;
             if authority_head != state.head {
-                let (Some(local_head), Some(authority_head)) =
-                    (state.head.clone(), authority_head.clone())
-                else {
-                    return Ok(PushResult::Diverged {
-                        local_head: state.head,
-                        authority_head,
-                    });
-                };
-                let base = authority.overlay(&local_head)?;
-                let remote = authority.overlay(&authority_head)?;
-                let local = capture_with_policy(
-                    &self.repo,
-                    &self.repo_id,
-                    &self.trunk_id,
-                    Some(local_head.clone()),
-                    now_ms,
-                    &self.chunks,
-                    ClassificationPolicy {
-                        version: base.snapshot.classification_version,
-                        patterns: base.snapshot.ignore_patterns.clone(),
-                    },
-                )?;
-                let (merged, conflicts) =
-                    three_way_files(&base.snapshot.files, &local.files, &remote.snapshot.files);
-                if !conflicts.is_empty() {
-                    let fork_overlay = overlay_against(&self.repo, local, &self.chunks)?;
-                    for entry in fork_overlay.upserts.values() {
-                        if !authority.has_chunk(&entry.chunk)? {
-                            authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+                if state.head.is_none()
+                    && let Some(authority_head) = authority_head.clone()
+                {
+                    let remote = authority.overlay(&authority_head)?;
+                    let local = capture_with_policy(
+                        &self.repo,
+                        &self.repo_id,
+                        &self.trunk_id,
+                        Some(authority_head.clone()),
+                        now_ms,
+                        &self.chunks,
+                        ClassificationPolicy {
+                            version: remote.snapshot.classification_version,
+                            patterns: remote.snapshot.ignore_patterns.clone(),
+                        },
+                    )?;
+                    let (merged, conflicts) =
+                        three_way_files(&BTreeMap::new(), &local.files, &remote.snapshot.files);
+                    if !conflicts.is_empty() {
+                        let fork_overlay = overlay_against(&self.repo, local, &self.chunks)?;
+                        for entry in fork_overlay.upserts.values() {
+                            if !authority.has_chunk(&entry.chunk)? {
+                                authority
+                                    .put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+                            }
                         }
+                        let fork = fork_overlay.snapshot.id.clone();
+                        authority.publish_fork(&fork_overlay, &self.trunk_id, now_ms)?;
+                        return Ok(PushResult::Conflicted {
+                            local_head: fork.clone(),
+                            authority_head,
+                            fork,
+                            paths: conflicts,
+                        });
                     }
-                    authority.publish_fork(&fork_overlay, &self.trunk_id, now_ms)?;
-                    return Ok(PushResult::Conflicted {
-                        local_head,
-                        authority_head,
-                        fork: fork_overlay.snapshot.id,
-                        paths: conflicts,
-                    });
+                    let mut target = remote;
+                    target.snapshot.files = merged;
+                    let delta = materialization_delta(&self.repo, &target, &local.files)?;
+                    self.ensure_materialization_chunks(authority, &target, &delta)?;
+                    materialize_overlay(&self.repo, &delta, &self.chunks)?;
+                    state.head = Some(authority_head);
+                    self.save_state(&state)?;
+                } else {
+                    let (Some(local_head), Some(authority_head)) =
+                        (state.head.clone(), authority_head.clone())
+                    else {
+                        return Ok(PushResult::Diverged {
+                            local_head: state.head,
+                            authority_head,
+                        });
+                    };
+                    let base = authority.overlay(&local_head)?;
+                    let remote = authority.overlay(&authority_head)?;
+                    let local = capture_with_policy(
+                        &self.repo,
+                        &self.repo_id,
+                        &self.trunk_id,
+                        Some(local_head.clone()),
+                        now_ms,
+                        &self.chunks,
+                        ClassificationPolicy {
+                            version: base.snapshot.classification_version,
+                            patterns: base.snapshot.ignore_patterns.clone(),
+                        },
+                    )?;
+                    let (merged, conflicts) =
+                        three_way_files(&base.snapshot.files, &local.files, &remote.snapshot.files);
+                    if !conflicts.is_empty() {
+                        let fork_overlay = overlay_against(&self.repo, local, &self.chunks)?;
+                        for entry in fork_overlay.upserts.values() {
+                            if !authority.has_chunk(&entry.chunk)? {
+                                authority
+                                    .put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+                            }
+                        }
+                        authority.publish_fork(&fork_overlay, &self.trunk_id, now_ms)?;
+                        return Ok(PushResult::Conflicted {
+                            local_head,
+                            authority_head,
+                            fork: fork_overlay.snapshot.id,
+                            paths: conflicts,
+                        });
+                    }
+                    let mut target = remote.clone();
+                    target.snapshot.files = merged;
+                    let delta = materialization_delta(&self.repo, &target, &local.files)?;
+                    self.ensure_materialization_chunks(authority, &target, &delta)?;
+                    materialize_overlay(&self.repo, &delta, &self.chunks)?;
+                    state.head = Some(authority_head);
+                    self.save_state(&state)?;
                 }
-                let mut target = remote.clone();
-                target.snapshot.files = merged;
-                let delta = materialization_delta(&self.repo, &target, &local.files)?;
-                self.ensure_materialization_chunks(authority, &target, &delta)?;
-                materialize_overlay(&self.repo, &delta, &self.chunks)?;
-                state.head = Some(authority_head);
-                self.save_state(&state)?;
             }
             let manifest = capture(
                 &self.repo,
