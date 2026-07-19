@@ -4,7 +4,7 @@ use pando::authority::{Authority, FileAuthority};
 use pando::clock::SystemClock;
 use pando::daemon::{WatchOptions, describe_pull, describe_push};
 use pando::sync::Trunk;
-use pando::transport::RemoteAuthority;
+use pando::transport::{RemoteAuthority, TransportKey};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,11 +18,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Keygen {
+        #[arg(long)]
+        output: PathBuf,
+    },
     Serve {
         #[arg(long, default_value = "0.0.0.0:7337")]
         bind: String,
         #[arg(long, default_value = ".pando-authority")]
         data: PathBuf,
+        #[arg(long, env = "PANDO_KEY")]
+        key: PathBuf,
     },
     Push(TrunkArgs),
     Pull(TrunkArgs),
@@ -39,12 +45,16 @@ enum Command {
         repo_id: String,
         #[arg(long)]
         authority: String,
+        #[arg(long, env = "PANDO_KEY")]
+        key: Option<PathBuf>,
     },
     Tui {
         #[arg(long)]
         repo_id: String,
         #[arg(long)]
         authority: String,
+        #[arg(long, env = "PANDO_KEY")]
+        key: Option<PathBuf>,
     },
     Demo {
         #[arg(long, default_value = ".pando-demo")]
@@ -62,20 +72,33 @@ struct TrunkArgs {
     trunk_id: String,
     #[arg(long)]
     authority: String,
+    #[arg(long, env = "PANDO_KEY")]
+    key: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Serve { bind, data } => {
+        Command::Keygen { output } => {
+            let key = TransportKey::generate(&output)?;
             println!(
-                "Pando authority listening on {bind}; data at {}",
-                data.display()
+                "created transport key {} (fingerprint {})",
+                output.display(),
+                key.fingerprint()
             );
-            pando::transport::serve(&bind, FileAuthority::open(data)?)
+            Ok(())
+        }
+        Command::Serve { bind, data, key } => {
+            let key = TransportKey::load(key)?;
+            println!(
+                "Pando authority listening securely on {bind}; data at {}; key {}",
+                data.display(),
+                key.fingerprint()
+            );
+            pando::transport::serve(&bind, FileAuthority::open(data)?, key)
         }
         Command::Push(args) => {
             let trunk = open_trunk(&args)?;
-            let mut authority = authority(&args.authority)?;
+            let mut authority = authority(&args.authority, args.key.as_deref())?;
             let result = trunk.push(authority.as_mut(), &SystemClock)?;
             trunk.release(authority.as_mut())?;
             println!("{}", describe_push(&result));
@@ -83,7 +106,7 @@ fn main() -> Result<()> {
         }
         Command::Pull(args) => {
             let trunk = open_trunk(&args)?;
-            let authority = authority(&args.authority)?;
+            let authority = authority(&args.authority, args.key.as_deref())?;
             println!(
                 "{}",
                 describe_pull(&trunk.pull(authority.as_ref(), &SystemClock)?)
@@ -95,7 +118,7 @@ fn main() -> Result<()> {
             quiescence_ms,
             idle_ms,
         } => {
-            let authority = authority(&trunk.authority)?;
+            let authority = authority(&trunk.authority, trunk.key.as_deref())?;
             let trunk = open_trunk(&trunk)?;
             pando::daemon::watch(
                 trunk,
@@ -110,8 +133,9 @@ fn main() -> Result<()> {
         Command::Status {
             repo_id,
             authority: endpoint,
+            key,
         } => {
-            let authority = authority(&endpoint)?;
+            let authority = authority(&endpoint, key.as_deref())?;
             let status = authority.status(&repo_id, pando::Clock::now_ms(&SystemClock))?;
             println!("repo: {}", status.repo_id);
             println!(
@@ -128,7 +152,8 @@ fn main() -> Result<()> {
         Command::Tui {
             repo_id,
             authority: endpoint,
-        } => pando::tui::run(authority(&endpoint)?, repo_id),
+            key,
+        } => pando::tui::run(authority(&endpoint, key.as_deref())?, repo_id),
         Command::Demo { root } => demo(&root),
     }
 }
@@ -137,9 +162,13 @@ fn open_trunk(args: &TrunkArgs) -> Result<Trunk> {
     Trunk::open(&args.repo, &args.repo_id, &args.trunk_id)
 }
 
-fn authority(endpoint: &str) -> Result<Box<dyn Authority>> {
+fn authority(endpoint: &str, key: Option<&Path>) -> Result<Box<dyn Authority>> {
     if let Some(address) = endpoint.strip_prefix("tcp://") {
-        Ok(Box::new(RemoteAuthority::new(address)))
+        let key_path = key.context("TCP authority requires --key or PANDO_KEY")?;
+        Ok(Box::new(RemoteAuthority::new(
+            address,
+            TransportKey::load(key_path)?,
+        )))
     } else {
         Ok(Box::new(FileAuthority::open(endpoint)?))
     }
