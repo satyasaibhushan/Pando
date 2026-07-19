@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pando::authority::{Authority, FileAuthority};
+use pando::classify::Classifier;
 use pando::clock::SystemClock;
 use pando::daemon::{WatchOptions, describe_pull, describe_push};
+use pando::rehydrate::Hydrator;
 use pando::sync::Trunk;
 use pando::transport::{RemoteAuthority, TransportKey};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -32,6 +34,31 @@ enum Command {
     },
     Push(TrunkArgs),
     Pull(TrunkArgs),
+    Hydrate {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+    Classify {
+        path: PathBuf,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        directory: bool,
+    },
+    Verify {
+        #[arg(long, default_value = ".pando-authority")]
+        data: PathBuf,
+    },
+    Restore {
+        #[arg(long, default_value = ".pando-authority")]
+        data: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     Watch {
         #[command(flatten)]
         trunk: TrunkArgs,
@@ -39,6 +66,10 @@ enum Command {
         quiescence_ms: u64,
         #[arg(long, default_value_t = 3_000)]
         idle_ms: u64,
+        #[arg(long, default_value_t = 60)]
+        full_scan_secs: u64,
+        #[arg(long)]
+        rehydrate: bool,
     },
     Status {
         #[arg(long)]
@@ -113,10 +144,63 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Hydrate { repo, force } => {
+            let summary = Hydrator::open(&repo)?.run_changed(force)?;
+            println!("{summary}");
+            Ok(())
+        }
+        Command::Classify {
+            path,
+            repo,
+            directory,
+        } => {
+            let repo = repo
+                .canonicalize()
+                .with_context(|| format!("resolve repository {}", repo.display()))?;
+            let relative = classification_path(&repo, &path)?;
+            let classification = Classifier::load(&repo)?
+                .explain(&relative, directory || repo.join(&relative).is_dir());
+            println!(
+                "{}: {}",
+                relative.display(),
+                if classification.portable {
+                    "portable"
+                } else {
+                    "excluded"
+                }
+            );
+            println!("reason: {}", classification.reason);
+            Ok(())
+        }
+        Command::Verify { data } => {
+            let report = FileAuthority::open_existing(&data)?.verify()?;
+            println!(
+                "verified {} heads, {} snapshots, {} chunks ({} bytes)",
+                report.heads, report.overlays, report.chunks, report.bytes
+            );
+            Ok(())
+        }
+        Command::Restore {
+            data,
+            snapshot,
+            destination,
+        } => {
+            let report = FileAuthority::open_existing(&data)?.restore(&snapshot, &destination)?;
+            println!(
+                "restored {} files ({} bytes) from {} to {}",
+                report.files,
+                report.bytes,
+                report.snapshot,
+                destination.display()
+            );
+            Ok(())
+        }
         Command::Watch {
             trunk,
             quiescence_ms,
             idle_ms,
+            full_scan_secs,
+            rehydrate,
         } => {
             let authority = authority(&trunk.authority, trunk.key.as_deref())?;
             let trunk = open_trunk(&trunk)?;
@@ -126,6 +210,8 @@ fn main() -> Result<()> {
                 WatchOptions {
                     quiescence: Duration::from_millis(quiescence_ms),
                     idle_release: Duration::from_millis(idle_ms),
+                    full_scan_interval: Duration::from_secs(full_scan_secs),
+                    rehydrate,
                     ..WatchOptions::default()
                 },
             )
@@ -156,6 +242,31 @@ fn main() -> Result<()> {
         } => pando::tui::run(authority(&endpoint, key.as_deref())?, repo_id),
         Command::Demo { root } => demo(&root),
     }
+}
+
+fn classification_path(repo: &Path, path: &Path) -> Result<PathBuf> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(repo).with_context(|| {
+            format!(
+                "{} is outside repository {}",
+                path.display(),
+                repo.display()
+            )
+        })?
+    } else {
+        path
+    };
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!("classification path must be a path inside the repository");
+    }
+    Ok(relative.to_owned())
 }
 
 fn open_trunk(args: &TrunkArgs) -> Result<Trunk> {

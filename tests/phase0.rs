@@ -1,8 +1,11 @@
 use pando::Clock;
 use pando::authority::{AcquireResult, Authority, FileAuthority};
 use pando::clock::{SystemClock, VirtualClock};
+use pando::model::{FileEntry, FileKind, Manifest, Overlay};
+use pando::snapshot::manifest_id;
 use pando::sync::{PullResult, PushResult, Trunk};
-use pando::transport::RemoteAuthority;
+use pando::transport::{RemoteAuthority, TransportKey};
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -89,6 +92,253 @@ fn dirty_tree_moves_between_two_trunks() {
         fs::read_to_string(harness.second_path.join("untracked.txt")).unwrap(),
         "new\n"
     );
+}
+
+#[test]
+fn authority_integrity_audit_verifies_history_and_detects_chunk_corruption() {
+    let harness = Harness::plain();
+    fs::write(harness.first_path.join("work.txt"), "integrity\n").unwrap();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    harness.clock.advance(1_000);
+    fs::write(harness.first_path.join("work.txt"), "changed!!\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+
+    let report = authority.verify().unwrap();
+    assert_eq!(report.heads, 1);
+    assert_eq!(report.overlays, 2);
+    assert_eq!(report.chunks, 2);
+    assert_eq!(report.bytes, 20);
+
+    let head = authority.head("repo").unwrap().unwrap();
+    let overlay = authority.overlay(&head).unwrap();
+    let hash = &overlay.snapshot.files["work.txt"].chunk;
+    fs::write(
+        authority
+            .root()
+            .join("chunks")
+            .join(&hash[..2])
+            .join(&hash[2..]),
+        "corrupt",
+    )
+    .unwrap();
+
+    let error = authority.verify().unwrap_err().to_string();
+    assert!(error.contains("corrupt chunk"), "{error}");
+}
+
+#[test]
+fn authority_integrity_audit_detects_tampered_snapshot_metadata() {
+    let harness = Harness::plain();
+    fs::write(harness.first_path.join("work.txt"), "integrity\n").unwrap();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    let head = authority.head("repo").unwrap().unwrap();
+    let mut overlay = authority.overlay(&head).unwrap();
+    overlay.snapshot.created_at_ms += 1;
+    fs::write(
+        authority
+            .root()
+            .join("overlays")
+            .join(format!("{head}.json")),
+        serde_json::to_vec_pretty(&overlay).unwrap(),
+    )
+    .unwrap();
+
+    let error = authority.verify().unwrap_err().to_string();
+    assert!(error.contains("content hashes to"), "{error}");
+}
+
+#[test]
+fn read_only_authority_open_does_not_create_a_missing_store() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+
+    assert!(FileAuthority::open_existing(&missing).is_err());
+    assert!(!missing.exists());
+}
+
+#[test]
+fn any_snapshot_restores_to_a_new_directory_without_overwriting() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    fs::write(harness.first_path.join("work.txt"), "first\n").unwrap();
+    let first_snapshot = match first.push(&mut authority, &harness.clock).unwrap() {
+        PushResult::Published { snapshot, .. } => snapshot,
+        result => panic!("unexpected push result: {result:?}"),
+    };
+    first.release(&mut authority).unwrap();
+    harness.clock.advance(1_000);
+    fs::write(harness.first_path.join("work.txt"), "second\n").unwrap();
+    let second_snapshot = match first.push(&mut authority, &harness.clock).unwrap() {
+        PushResult::Published { snapshot, .. } => snapshot,
+        result => panic!("unexpected push result: {result:?}"),
+    };
+    first.release(&mut authority).unwrap();
+
+    let first_destination = harness._root.path().join("restore-first");
+    let second_destination = harness._root.path().join("restore-second");
+    let first_report = authority
+        .restore(&first_snapshot, &first_destination)
+        .unwrap();
+    authority
+        .restore(&second_snapshot, &second_destination)
+        .unwrap();
+
+    assert_eq!(first_report.files, 1);
+    assert_eq!(
+        fs::read_to_string(first_destination.join("work.txt")).unwrap(),
+        "first\n"
+    );
+    assert_eq!(
+        fs::read_to_string(second_destination.join("work.txt")).unwrap(),
+        "second\n"
+    );
+    let error = authority
+        .restore(&second_snapshot, &first_destination)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(
+        fs::read_to_string(first_destination.join("work.txt")).unwrap(),
+        "first\n"
+    );
+}
+
+#[test]
+fn verify_and_restore_cli_exercise_an_authority_snapshot() {
+    let harness = Harness::plain();
+    fs::write(harness.first_path.join("work.txt"), "cli restore\n").unwrap();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    let snapshot = match first.push(&mut authority, &harness.clock).unwrap() {
+        PushResult::Published { snapshot, .. } => snapshot,
+        result => panic!("unexpected push result: {result:?}"),
+    };
+    first.release(&mut authority).unwrap();
+
+    let verify = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .args(["verify", "--data", harness.authority_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{:?}", verify.stderr);
+    assert!(String::from_utf8_lossy(&verify.stdout).contains("verified 1 heads, 1 snapshots"));
+
+    let destination = harness._root.path().join("cli-restore");
+    let restore = Command::new(env!("CARGO_BIN_EXE_pando"))
+        .args([
+            "restore",
+            "--data",
+            harness.authority_path.to_str().unwrap(),
+            "--snapshot",
+            &snapshot,
+            "--destination",
+            destination.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(restore.status.success(), "{:?}", restore.stderr);
+    assert_eq!(
+        fs::read_to_string(destination.join("work.txt")).unwrap(),
+        "cli restore\n"
+    );
+}
+
+#[test]
+fn authority_rejects_reserved_snapshot_paths() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let bytes = b"malicious";
+    let chunk = blake3::hash(bytes).to_hex().to_string();
+    authority.put_chunk(&chunk, bytes).unwrap();
+    authority
+        .acquire("repo", "macbook", harness.clock.now_ms(), 30_000)
+        .unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        ".pando/state".to_owned(),
+        FileEntry {
+            chunk,
+            size: bytes.len() as u64,
+            kind: FileKind::Regular,
+            executable: false,
+        },
+    );
+    let mut manifest = Manifest {
+        id: String::new(),
+        repo_id: "repo".into(),
+        trunk_id: "macbook".into(),
+        created_at_ms: harness.clock.now_ms(),
+        parent: None,
+        base_commit: None,
+        classification_version: 1,
+        ignore_patterns: Vec::new(),
+        files: files.clone(),
+    };
+    manifest.id = manifest_id(&manifest).unwrap();
+    let overlay = Overlay {
+        snapshot: manifest,
+        upserts: files,
+        deletes: Vec::new(),
+    };
+
+    let error = authority
+        .publish(&overlay, "macbook", harness.clock.now_ms())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unsafe snapshot path"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialization_refuses_to_traverse_existing_symlink_ancestors() {
+    use pando::snapshot::materialize_overlay;
+    use pando::store::ChunkStore;
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, repo.join("link")).unwrap();
+    let store = ChunkStore::new(root.path().join("chunks")).unwrap();
+    let chunk = store.put(b"escape").unwrap();
+    let entry = FileEntry {
+        chunk,
+        size: 6,
+        kind: FileKind::Regular,
+        executable: false,
+    };
+    let mut files = BTreeMap::new();
+    files.insert("link/escaped.txt".to_owned(), entry.clone());
+    let overlay = Overlay {
+        snapshot: Manifest {
+            id: "snapshot".into(),
+            repo_id: "repo".into(),
+            trunk_id: "macbook".into(),
+            created_at_ms: 1,
+            parent: None,
+            base_commit: None,
+            classification_version: 1,
+            ignore_patterns: Vec::new(),
+            files,
+        },
+        upserts: BTreeMap::from([("link/escaped.txt".to_owned(), entry)]),
+        deletes: Vec::new(),
+    };
+
+    let error = materialize_overlay(&repo, &overlay, &store)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("traverses symlink"), "{error}");
+    assert!(!outside.join("escaped.txt").exists());
 }
 
 #[test]
@@ -524,6 +774,237 @@ fn only_the_root_pando_directory_is_reserved() {
 }
 
 #[test]
+fn derived_and_local_only_paths_never_enter_a_snapshot() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    fs::write(harness.first_path.join("source.rs"), "fn main() {}\n").unwrap();
+    fs::write(harness.first_path.join(".gitignore"), ".env\n").unwrap();
+    fs::write(harness.first_path.join(".env"), "TOKEN=portable\n").unwrap();
+    for path in [
+        "target/debug/app",
+        "node_modules/pkg/index.js",
+        ".venv/bin/python",
+        "pkg/__pycache__/module.pyc",
+        ".next/cache/data",
+    ] {
+        let path = harness.first_path.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "derived\n").unwrap();
+    }
+    fs::write(harness.first_path.join(".DS_Store"), "local\n").unwrap();
+
+    harness
+        .first()
+        .push(&mut authority, &harness.clock)
+        .unwrap();
+    let head = authority.head("repo").unwrap().unwrap();
+    let snapshot = authority.overlay(&head).unwrap().snapshot;
+
+    assert!(snapshot.files.contains_key("source.rs"));
+    assert!(snapshot.files.contains_key(".env"));
+    for path in [
+        "target/debug/app",
+        "node_modules/pkg/index.js",
+        ".venv/bin/python",
+        "pkg/__pycache__/module.pyc",
+        ".next/cache/data",
+        ".DS_Store",
+    ] {
+        assert!(!snapshot.files.contains_key(path), "captured {path}");
+    }
+}
+
+#[test]
+fn ignored_local_state_survives_initial_pull() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    fs::write(harness.first_path.join("source.txt"), "portable\n").unwrap();
+    for path in ["target/local.bin", "node_modules/local/index.js"] {
+        let path = harness.second_path.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "keep local\n").unwrap();
+    }
+    fs::write(harness.second_path.join(".DS_Store"), "keep local\n").unwrap();
+    #[cfg(unix)]
+    let _socket =
+        std::os::unix::net::UnixListener::bind(harness.second_path.join("local-service.sock"))
+            .unwrap();
+
+    let first = harness.first();
+    let second = harness.second();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    assert!(matches!(
+        second.pull(&authority, &harness.clock).unwrap(),
+        PullResult::Applied { .. }
+    ));
+
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("target/local.bin")).unwrap(),
+        "keep local\n"
+    );
+    assert!(
+        harness
+            .second_path
+            .join("node_modules/local/index.js")
+            .is_file()
+    );
+    assert!(harness.second_path.join(".DS_Store").is_file());
+    #[cfg(unix)]
+    assert!(harness.second_path.join("local-service.sock").exists());
+}
+
+#[test]
+fn pandoignore_can_add_ignores_and_override_builtins() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    fs::write(
+        harness.first_path.join(".pandoignore"),
+        "scratch/\n!/target/\n",
+    )
+    .unwrap();
+    for (path, contents) in [
+        ("scratch/drop.txt", "source scratch\n"),
+        ("target/keep.txt", "explicitly portable\n"),
+    ] {
+        let path = harness.first_path.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    fs::create_dir_all(harness.second_path.join("scratch")).unwrap();
+    fs::write(
+        harness.second_path.join("scratch/local.txt"),
+        "receiver scratch\n",
+    )
+    .unwrap();
+
+    let first = harness.first();
+    let second = harness.second();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+    let head = authority.head("repo").unwrap().unwrap();
+    let snapshot = authority.overlay(&head).unwrap().snapshot;
+
+    assert!(snapshot.files.contains_key(".pandoignore"));
+    assert!(snapshot.files.contains_key("target/keep.txt"));
+    assert!(!snapshot.files.contains_key("scratch/drop.txt"));
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("target/keep.txt")).unwrap(),
+        "explicitly portable\n"
+    );
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("scratch/local.txt")).unwrap(),
+        "receiver scratch\n"
+    );
+}
+
+#[test]
+fn newly_ignored_paths_are_preserved_on_receivers() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    let first = harness.first();
+    let second = harness.second();
+    fs::create_dir_all(harness.first_path.join("scratch")).unwrap();
+    fs::write(
+        harness.first_path.join("scratch/state.txt"),
+        "local state\n",
+    )
+    .unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    harness.clock.advance(1_000);
+    fs::write(harness.first_path.join(".pandoignore"), "scratch/\n").unwrap();
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("scratch/state.txt")).unwrap(),
+        "local state\n"
+    );
+}
+
+#[test]
+fn phase0_snapshots_migrate_without_deleting_derived_state() {
+    let harness = Harness::plain();
+    let mut authority = harness.authority();
+    fs::create_dir_all(harness.first_path.join("target")).unwrap();
+    fs::write(harness.first_path.join("source.txt"), "portable\n").unwrap();
+    fs::write(
+        harness.first_path.join("target/cache.bin"),
+        "legacy synced cache\n",
+    )
+    .unwrap();
+    let source = b"portable\n";
+    let cache = b"legacy synced cache\n";
+    let source_hash = blake3::hash(source).to_hex().to_string();
+    let cache_hash = blake3::hash(cache).to_hex().to_string();
+    authority.put_chunk(&source_hash, source).unwrap();
+    authority.put_chunk(&cache_hash, cache).unwrap();
+    let files = BTreeMap::from([
+        (
+            "source.txt".into(),
+            FileEntry {
+                chunk: source_hash,
+                size: source.len() as u64,
+                kind: FileKind::Regular,
+                executable: false,
+            },
+        ),
+        (
+            "target/cache.bin".into(),
+            FileEntry {
+                chunk: cache_hash,
+                size: cache.len() as u64,
+                kind: FileKind::Regular,
+                executable: false,
+            },
+        ),
+    ]);
+    let mut manifest = Manifest {
+        id: String::new(),
+        repo_id: "repo".into(),
+        trunk_id: "legacy".into(),
+        created_at_ms: harness.clock.now_ms(),
+        parent: None,
+        base_commit: None,
+        classification_version: 0,
+        ignore_patterns: Vec::new(),
+        files: files.clone(),
+    };
+    manifest.id = manifest_id(&manifest).unwrap();
+    let overlay = Overlay {
+        snapshot: manifest,
+        upserts: files,
+        deletes: Vec::new(),
+    };
+    authority
+        .acquire("repo", "legacy", harness.clock.now_ms(), 1_000)
+        .unwrap();
+    authority
+        .publish(&overlay, "legacy", harness.clock.now_ms())
+        .unwrap();
+    authority.release("repo", "legacy").unwrap();
+
+    let first = harness.first();
+    let second = harness.second();
+    first.pull(&authority, &harness.clock).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+    harness.clock.advance(1_000);
+    first.push(&mut authority, &harness.clock).unwrap();
+    first.release(&mut authority).unwrap();
+    second.pull(&authority, &harness.clock).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("target/cache.bin")).unwrap(),
+        "legacy synced cache\n"
+    );
+}
+
+#[test]
 fn interrupted_upload_never_advances_the_head() {
     let harness = Harness::plain();
     let mut authority = harness.authority();
@@ -560,8 +1041,12 @@ fn tcp_authority_transports_a_snapshot() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let authority = harness.authority();
-    std::thread::spawn(move || pando::transport::serve_listener(listener, authority).unwrap());
-    let mut remote = RemoteAuthority::new(address.to_string());
+    let key = TransportKey::from_bytes([7; 32]);
+    let server_key = key.clone();
+    std::thread::spawn(move || {
+        pando::transport::serve_listener(listener, authority, server_key).unwrap()
+    });
+    let mut remote = RemoteAuthority::new(address.to_string(), key);
     fs::write(harness.first_path.join("network.txt"), "over tcp\n").unwrap();
 
     let first = harness.first();
@@ -573,6 +1058,25 @@ fn tcp_authority_transports_a_snapshot() {
     assert_eq!(
         fs::read_to_string(harness.second_path.join("network.txt")).unwrap(),
         "over tcp\n"
+    );
+}
+
+#[test]
+fn tcp_authority_rejects_a_client_with_the_wrong_key() {
+    let harness = Harness::plain();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let authority = harness.authority();
+    std::thread::spawn(move || {
+        pando::transport::serve_listener(listener, authority, TransportKey::from_bytes([1; 32]))
+            .unwrap()
+    });
+    let remote = RemoteAuthority::new(address.to_string(), TransportKey::from_bytes([2; 32]));
+
+    let error = remote.head("repo").unwrap_err();
+    assert!(
+        format!("{error:#}").contains("secure authority handshake"),
+        "{error:#}"
     );
 }
 

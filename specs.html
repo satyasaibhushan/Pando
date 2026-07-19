@@ -166,7 +166,7 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
       <h1>Pando<span class="dot">.</span> Technical Spec</h1>
     </div>
     <div class="meta">
-      status: <span style="color:#e2a53c">phase 0 implementation ready for field gate</span><br>
+      status: <span style="color:#e2a53c">phase 1 daily-driver baseline in progress</span><br>
       drafted: july 2026 · owner: satyasaibhushan<br>
       <a href="index.html">← the vision page</a>
     </div>
@@ -311,8 +311,9 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
     <li><strong>Artifact CAS:</strong> pure-JS packages/wheels shared across platforms and <em>users</em> (public bytes aren't secrets); native modules keyed by platform triple. Installs become hardlinks + a few downloads — the pnpm-store trick, machine-spanning.</li>
     <li><strong>Pre-warm tier (optional):</strong> an always-on builder (user's box or cloud) hydrates its platform variant the moment a lockfile changes elsewhere. Floor is hydrate-on-arrival from warm CAS (seconds); pre-warm upgrades that to zero. Repos' own CI caches (GitHub Actions) can serve as builders.</li>
   </ul>
+  <p class="dim"><strong>Implementation status:</strong> Phase 1 detects root and nested npm/uv projects, invokes <code>npm ci</code> or <code>uv sync --frozen</code> directly without a shell, and caches successful manifest-plus-lockfile fingerprints outside the repository. <code>pando hydrate</code> runs explicitly; <code>pando watch --rehydrate</code> runs changed recipes after remote materialization. Failures remain retryable and derived-tree watcher events are ignored. Execution is deliberately opt-in because package managers may use the network and execute trusted repository hooks. Non-blocking execution, broader recipe coverage, and a per-platform artifact cache remain follow-up work.</p>
   <h3>Ignore rules</h3>
-  <p>Layered like gitignore, but with taste: <strong>built-in defaults</strong> (ship knowing <code>node_modules</code>, <code>.venv</code>, <code>target</code>…) → <strong>global</strong> <code>~/.config/pando/ignore</code> → <strong>per-repo</strong> <code>.pandoignore</code>, which inherits <code>.gitignore</code> and expresses deltas only — notably <em>"gitignored but sync anyway"</em> (<code>.env</code>). 95% of users should never write a rule.</p>
+  <p>Portable by default, with conservative <strong>built-in defaults</strong> for known derived and machine-local paths (<code>node_modules</code>, <code>.venv</code>, root <code>target</code>, tool caches, OS clutter), user-wide rules in <code>~/.config/pando/ignore</code>, and per-repo <code>.pandoignore</code>; both files use Git-ignore syntax. Precedence runs built-in → user-wide → repository. Snapshot manifests carry the flattened policy so receivers classify and preserve local state consistently. Pando deliberately does not inherit <code>.gitignore</code>: Git-ignored secrets and working state such as <code>.env</code> are portable unless explicitly excluded. <code>pando classify</code> reports the winning rule and source without mutating the tree.</p>
 </section>
 
 <section id="topology">
@@ -329,6 +330,7 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
 
 <section id="security">
   <h2><span class="sn">§07</span>Security model</h2>
+  <p class="dim"><strong>Implementation status:</strong> Phase 1 wraps every authority RPC in an authenticated Noise <code>NNpsk0</code> session using a shared 32-byte fabric key and ChaCha20-Poly1305. Wrong-key, tampered, and legacy plaintext traffic is rejected. The two-Mac self-hosted topology treats the authority as trusted, so plaintext authority storage is acceptable here. Ciphertext-only storage, individual enrollment, and revocation become release gates before any hosted or otherwise untrusted authority.</p>
   <ul>
     <li><strong>E2E by default; the authority stores ciphertext.</strong> Not a feature bullet — qualification to exist, and the moat platforms won't cross (they want to read working trees for AI context; Pando cryptographically can't).</li>
     <li><strong>Keys:</strong> per-user master key → deterministic per-chunk keys (preserves within-account dedup). Device enrollment via existing-device approval (Tailscale/iMessage pattern). Compress before encrypt.</li>
@@ -391,24 +393,23 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
 
 <section id="roadmap">
   <h2><span class="sn">§12</span>Roadmap &amp; task tracking</h2>
-  <p class="dim">Checkboxes persist in this browser (localStorage). Each phase ends in a gate — an explicit decision, not a vibe.</p>
+  <p class="dim">Completed project tasks are checked in this specification; additional personal progress persists in this browser (localStorage). Each phase ends in a gate — an explicit decision, not a vibe.</p>
 
   <div class="phase" data-phase="p0">
     <div class="phase-head">
       <div class="p-title"><h3>Phase 0 — Prove the magic</h3><span class="p-count"></span></div>
-      <div class="goal">1–2 weekends · two machines, my repos, no encryption · deliverable is the <em>feeling</em>: close the MacBook mid-edit, open the linuxbox, it's all there.</div>
+      <div class="goal">1–2 weekends · two machines, my repos, no encryption · deliverable is the <em>feeling</em>: stop editing on one machine, open the other, it's all there.</div>
       <div class="p-bar"><i></i></div>
     </div>
-    <div class="gate"><b>Gate</b>If that moment doesn't hook me → stop; two weekends spent, answer bought. In parallel: run the two-week remote-dev control experiment (Tailscale + VS Code Remote into the linuxbox) — every frustration it produces is Pando's spec; none, and Pando may be unnecessary.</div>
+    <div class="gate"><b>Gate passed</b>The live two-Mac handoff worked: dirty files, branch, index, and stash arrived on the second machine. Longer dogfooding and the remote-dev control experiment move to Phase 1 because Phase 0's plaintext transport and full-tree replication were intentionally not daily-driver safe.</div>
     <ul class="tasks">
-      <li><label><input type="checkbox" data-id="p0-1"><span><span class="sub">harness</span>Multi-machine simulation harness first: N fake trunks as processes, virtual clocks, adversarial interleavings (offline edits, lease steals, kill mid-sync)</span></label></li>
-      <li><label><input type="checkbox" data-id="p0-2"><span><span class="sub">daemon</span>Watcher daemon (FSEvents + inotify): quiescence detection → shadow snapshot into git object store, dura-style, HEAD/index untouched</span></label></li>
-      <li><label><input type="checkbox" data-id="p0-3"><span><span class="sub">daemon</span>Snapshot DAG + manifests: whole-tree capture incl. untracked + <code>.git</code> refs/stash/index; content-addressed chunks</span></label></li>
-      <li><label><input type="checkbox" data-id="p0-4"><span><span class="sub">sync</span>Overlay computation against pushed refs; transport to a v0 authority (tiny service or the linuxbox)</span></label></li>
-      <li><label><input type="checkbox" data-id="p0-5"><span><span class="sub">lease</span>Lease table + implicit acquire-on-activity, release-on-idle/lid-close; divergence = hard refuse (fork UX comes in P1)</span></label></li>
-      <li><label><input type="checkbox" data-id="p0-6"><span><span class="sub">cli</span><code>pando status</code>: lease holder, exposure (unpushed bytes), last snapshot age, per-repo pin list</span></label></li>
-      <li><label><input type="checkbox" data-id="p0-7"><span><span class="sub">e2e</span>The demo: dirty tree on MacBook → lid close → linuxbox renders it (files + branch + stash) within seconds</span></label></li>
-      <li><label><input type="checkbox" data-id="p0-8"><span><span class="sub">control</span>Two-week remote-dev experiment log: every friction moment written down</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-1" checked><span><span class="sub">harness</span>Deterministic multi-trunk simulation harness: virtual clocks, TCP boundary, and adversarial interleavings (lease steals, interrupted uploads, stale receivers, and dirty divergence)</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-2" checked><span><span class="sub">daemon</span>Native watcher daemon (FSEvents + inotify through <code>notify</code>): quiescence detection → immutable content-addressed snapshot, HEAD/index untouched</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-3" checked><span><span class="sub">daemon</span>Snapshot DAG + manifests: whole-tree capture incl. untracked + <code>.git</code> refs/stash/index; content-addressed chunks</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-4" checked><span><span class="sub">sync</span>Overlay computation against pushed refs; compact binary transport to a v0 authority (tiny service or an always-on machine)</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-5" checked><span><span class="sub">lease</span>Lease table + implicit acquire-on-activity, release-on-idle/graceful shutdown, TTL takeover after sleep/offline; divergence = hard refuse (fork UX comes in P1)</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-6" checked><span><span class="sub">cli</span><code>pando status</code> + TUI: lease holder, current head, exposure (unpushed bytes), and last snapshot age; repos configured explicitly in P0</span></label></li>
+      <li><label><input type="checkbox" data-id="p0-7" checked><span><span class="sub">e2e</span>Live field proof: dirty tree on one Mac → second Mac renders files + branch + index + stash within seconds</span></label></li>
     </ul>
   </div>
 
@@ -421,15 +422,20 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
     <div class="gate"><b>Gate</b>The retention test: after a month, can I tolerate going back to plain git-push discipline or remote-dev? Physically refusing to churn = strongest possible signal. Only then does Phase 2 exist.</div>
     <ul class="tasks">
       <li><label><input type="checkbox" data-id="p1-1"><span><span class="sub">conflict</span>Fork-and-merge: DAG branching on offline divergence, three-way auto-merge when non-overlapping, reconcile UI otherwise</span></label></li>
-      <li><label><input type="checkbox" data-id="p1-2"><span><span class="sub">classify</span>Bucket engine + built-in defaults + <code>~/.config/pando/ignore</code> + <code>.pandoignore</code> (inherits .gitignore, deltas only)</span></label></li>
-      <li><label><input type="checkbox" data-id="p1-3"><span><span class="sub">rehydrate</span>Recipe runner: lockfile change / repo materialize → <code>npm ci</code> / <code>uv sync</code> in background; per-platform artifact cache (local store first)</span></label></li>
-      <li><label><input type="checkbox" data-id="p1-4"><span><span class="sub">secrets</span>E2E encryption of overlays: master key → per-chunk keys, compress-then-encrypt; <code>.env</code> travels, GitHub never sees it</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-2a" checked><span><span class="sub">classify</span>Versioned portable/derived/local classifier + conservative built-ins + snapshot-carried <code>.pandoignore</code>; ignored receiver state is never deleted</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-2" checked><span><span class="sub">classify</span>User-wide classification rules + <code>pando classify</code> winning-rule explanations and diagnostics</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-3a" checked><span><span class="sub">rehydrate</span>Opt-in npm/uv recipe runner: root + nested detection, direct no-shell execution after materialization, successful-input fingerprint cache, failure retry, and classified watcher events</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-3"><span><span class="sub">rehydrate</span>Non-blocking daemon execution + broader recipe coverage + per-platform artifact cache (local store first) and optional pre-warm</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-4a" checked><span><span class="sub">transport</span>Authenticated encrypted RPC channel: shared fabric key → Noise <code>NNpsk0</code> + ChaCha20-Poly1305; reject wrong-key, tampered, and plaintext peers</span></label></li>
       <li><label><input type="checkbox" data-id="p1-5"><span><span class="sub">github</span>Auto-fetch daemon + shared remote-tracking view; overlay GC on push; exposure metric in status</span></label></li>
       <li><label><input type="checkbox" data-id="p1-6"><span><span class="sub">github</span>Force-push rescue: detect non-FF ref moves, promote endangered bases into overlay</span></label></li>
       <li><label><input type="checkbox" data-id="p1-7"><span><span class="sub">github</span>Escape hatch: encrypted snapshot bundles to <code>refs/pando/…</code> every ~10 min + standalone restore script</span></label></li>
-      <li><label><input type="checkbox" data-id="p1-8"><span><span class="sub">integrity</span>Periodic full-scan backstop; append-only guarantees audited; restore-from-any-snapshot exercised weekly on real repos</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-8a" checked><span><span class="sub">integrity</span>60-second classified full-scan watcher backstop + read-only <code>pando verify</code> audit of chunk hashes, snapshot IDs, overlay shape, ancestry, and heads</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-8b" checked><span><span class="sub">integrity</span>Safe restore from any retained snapshot into a new atomic destination; hash/path/symlink validation and no overwrite mode</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-8"><span><span class="sub">integrity</span>Scheduled audit/restore drill exercised weekly on real repositories</span></label></li>
       <li><label><input type="checkbox" data-id="p1-9"><span><span class="sub">platform</span>macOS + Linux solid: sleep/wake, APFS case quirks, systemd/launchd packaging of the daemon</span></label></li>
       <li><label><input type="checkbox" data-id="p1-10"><span><span class="sub">dogfood</span>All personal repos on Pando; every anomaly becomes a harness regression test</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-11"><span><span class="sub">control</span>After the security and classification baseline lands, run the two-week Pando vs. remote-development control experiment and log every friction moment</span></label></li>
     </ul>
   </div>
 
@@ -443,7 +449,7 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
     <ul class="tasks">
       <li><label><input type="checkbox" data-id="p2-1"><span><span class="sub">cloud</span>Hosted authority: R2-class overlay store + Postgres control plane; Tier-1 promotion (<code>pando promote</code>) for BYO boxes</span></label></li>
       <li><label><input type="checkbox" data-id="p2-2"><span><span class="sub">identity</span>GitHub OAuth onboarding: sign in → repo list → pin → done; multi-remote support (GitLab/Bitbucket/bare)</span></label></li>
-      <li><label><input type="checkbox" data-id="p2-3"><span><span class="sub">keys</span>Real key management: device enrollment via existing-device approval, recovery phrase flow, key rotation — first-class UX design, not an afterthought</span></label></li>
+      <li><label><input type="checkbox" data-id="p2-3"><span><span class="sub">keys</span>Hosted-authority security gate: ciphertext-only chunks + encrypted manifests, device enrollment via existing-device approval, recovery phrase, revocation, and key rotation</span></label></li>
       <li><label><input type="checkbox" data-id="p2-4"><span><span class="sub">cas</span>Global artifact CAS: platform-keyed public package store, CDN-fronted; optional GitHub-Actions-as-builder</span></label></li>
       <li><label><input type="checkbox" data-id="p2-5"><span><span class="sub">platform</span>Windows support; installers/packages for all three OSes</span></label></li>
       <li><label><input type="checkbox" data-id="p2-6"><span><span class="sub">agents</span>Agent leases: branch/worktree-scoped leases so agent fleets and humans share the fabric without contention</span></label></li>
@@ -478,7 +484,7 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
 
   var boxes = document.querySelectorAll('.tasks input[type="checkbox"]');
   boxes.forEach(function (box) {
-    box.checked = !!state[box.dataset.id];
+    box.checked = box.defaultChecked || !!state[box.dataset.id];
     box.addEventListener("change", function () {
       state[box.dataset.id] = box.checked;
       try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
