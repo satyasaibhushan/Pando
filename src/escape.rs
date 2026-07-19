@@ -87,7 +87,7 @@ pub fn export<A: Authority + ?Sized>(
         });
     }
     let mut chunks = BTreeMap::new();
-    for entry in overlay.snapshot.files.values() {
+    for entry in overlay.upserts.values() {
         if !chunks.contains_key(&entry.chunk) {
             chunks.insert(entry.chunk.clone(), authority.get_chunk(&entry.chunk)?);
         }
@@ -301,8 +301,7 @@ fn validate_bundle(bundle: &Bundle) -> Result<()> {
     }
     let required: BTreeSet<_> = bundle
         .overlay
-        .snapshot
-        .files
+        .upserts
         .values()
         .map(|entry| entry.chunk.as_str())
         .collect();
@@ -351,6 +350,20 @@ fn restore_bundle(bundle: Bundle, destination: &Path) -> Result<EscapeRestoreRep
             store.put_verified(hash, bytes)?;
         }
         let mut overlay = bundle.overlay.clone();
+        if let Some(commit) = overlay.snapshot.base_commit.as_deref() {
+            let git_overlay = Overlay {
+                snapshot: overlay.snapshot.clone(),
+                upserts: overlay
+                    .upserts
+                    .iter()
+                    .filter(|(path, _)| *path == ".git" || path.starts_with(".git/"))
+                    .map(|(path, entry)| (path.clone(), entry.clone()))
+                    .collect(),
+                deletes: Vec::new(),
+            };
+            materialize_overlay(&temporary, &git_overlay, &store)?;
+            crate::git::baseline(&temporary, commit, &store)?;
+        }
         overlay.upserts = overlay.snapshot.files.clone();
         overlay.deletes.clear();
         materialize_overlay(&temporary, &overlay, &store)?;

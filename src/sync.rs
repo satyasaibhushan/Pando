@@ -170,7 +170,7 @@ impl Trunk {
                     three_way_files(&base.snapshot.files, &local.files, &remote.snapshot.files);
                 if !conflicts.is_empty() {
                     let fork_overlay = overlay_against(&self.repo, local, &self.chunks)?;
-                    for entry in fork_overlay.snapshot.files.values() {
+                    for entry in fork_overlay.upserts.values() {
                         if !authority.has_chunk(&entry.chunk)? {
                             authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
                         }
@@ -186,12 +186,7 @@ impl Trunk {
                 let mut target = remote.clone();
                 target.snapshot.files = merged;
                 let delta = materialization_delta(&self.repo, &target, &local.files)?;
-                for entry in delta.upserts.values() {
-                    if !self.chunks.contains(&entry.chunk) {
-                        let bytes = authority.get_chunk(&entry.chunk)?;
-                        self.chunks.put_verified(&entry.chunk, &bytes)?;
-                    }
-                }
+                self.ensure_materialization_chunks(authority, &target, &delta)?;
                 materialize_overlay(&self.repo, &delta, &self.chunks)?;
                 state.head = Some(authority_head);
                 self.save_state(&state)?;
@@ -221,7 +216,7 @@ impl Trunk {
             }
             let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
             let mut uploaded = 0;
-            for entry in overlay.snapshot.files.values() {
+            for entry in overlay.upserts.values() {
                 if !authority.has_chunk(&entry.chunk)? {
                     authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
                     uploaded += 1;
@@ -319,14 +314,7 @@ impl Trunk {
         }
 
         let delta = materialization_delta(&self.repo, &overlay, &current.files)?;
-        let mut downloaded = 0;
-        for entry in delta.upserts.values() {
-            if !self.chunks.contains(&entry.chunk) {
-                let bytes = authority.get_chunk(&entry.chunk)?;
-                self.chunks.put_verified(&entry.chunk, &bytes)?;
-                downloaded += 1;
-            }
-        }
+        let downloaded = self.ensure_materialization_chunks(authority, &overlay, &delta)?;
         materialize_overlay(&self.repo, &delta, &self.chunks)?;
         state.head = Some(authority_head.clone());
         self.save_state(&state)?;
@@ -419,7 +407,7 @@ impl Trunk {
             manifest.parent = Some(authority_head);
             manifest.id = manifest_id(&manifest)?;
             let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
-            for entry in overlay.snapshot.files.values() {
+            for entry in overlay.upserts.values() {
                 if !authority.has_chunk(&entry.chunk)? {
                     authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
                 }
@@ -488,6 +476,9 @@ impl Trunk {
             .filter(|(path, _)| !path.starts_with(".git/"))
             .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect();
+        if current_files.is_empty() {
+            return Ok(true);
+        }
         let classifier = Classifier::from_policy(
             &self.repo,
             overlay.snapshot.classification_version,
@@ -508,13 +499,78 @@ impl Trunk {
         current: &BTreeMap<String, crate::model::FileEntry>,
     ) -> Result<()> {
         let delta = materialization_delta(&self.repo, target, current)?;
+        self.ensure_materialization_chunks(authority, target, &delta)?;
+        materialize_overlay(&self.repo, &delta, &self.chunks)
+    }
+
+    fn ensure_materialization_chunks<A: Authority + ?Sized>(
+        &self,
+        authority: &A,
+        target: &crate::model::Overlay,
+        delta: &crate::model::Overlay,
+    ) -> Result<usize> {
+        let mut downloaded = 0;
+        if delta
+            .upserts
+            .values()
+            .any(|entry| !self.chunks.contains(&entry.chunk))
+            && target.snapshot.base_commit.is_some()
+        {
+            for (path, entry) in &target.upserts {
+                if (path == ".git" || path.starts_with(".git/"))
+                    && !self.chunks.contains(&entry.chunk)
+                {
+                    let bytes = authority.get_chunk(&entry.chunk)?;
+                    self.chunks.put_verified(&entry.chunk, &bytes)?;
+                    downloaded += 1;
+                }
+            }
+            self.reconstruct_git_baseline(target)?;
+        }
         for entry in delta.upserts.values() {
             if !self.chunks.contains(&entry.chunk) {
                 let bytes = authority.get_chunk(&entry.chunk)?;
                 self.chunks.put_verified(&entry.chunk, &bytes)?;
+                downloaded += 1;
             }
         }
-        materialize_overlay(&self.repo, &delta, &self.chunks)
+        Ok(downloaded)
+    }
+
+    fn reconstruct_git_baseline(&self, target: &crate::model::Overlay) -> Result<()> {
+        let Some(commit) = target.snapshot.base_commit.as_deref() else {
+            return Ok(());
+        };
+        let temporary = std::env::temp_dir().join(format!(
+            "pando-baseline-{}-{}",
+            std::process::id(),
+            crate::model::short_id(&target.snapshot.id)
+        ));
+        if temporary.exists() {
+            anyhow::bail!(
+                "temporary baseline path already exists: {}",
+                temporary.display()
+            );
+        }
+        let result = (|| {
+            let repo = temporary.join("repo");
+            let git_upserts = target
+                .upserts
+                .iter()
+                .filter(|(path, _)| *path == ".git" || path.starts_with(".git/"))
+                .map(|(path, entry)| (path.clone(), entry.clone()))
+                .collect();
+            let git_overlay = crate::model::Overlay {
+                snapshot: target.snapshot.clone(),
+                upserts: git_upserts,
+                deletes: Vec::new(),
+            };
+            materialize_overlay(&repo, &git_overlay, &self.chunks)?;
+            crate::git::baseline(&repo, commit, &self.chunks)?;
+            Result::<()>::Ok(())
+        })();
+        let _ = fs::remove_dir_all(&temporary);
+        result
     }
 }
 

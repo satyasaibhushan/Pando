@@ -1557,6 +1557,102 @@ fn authority_gc_reclaims_only_resolved_forks_and_orphan_chunks() {
     authority.verify().unwrap();
 }
 
+#[test]
+fn pushed_base_chunks_compact_and_reconstruct_for_pull_restore_and_escape() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("remote.git");
+    let first_repo = root.path().join("first");
+    let second_repo = root.path().join("second");
+    let recovery_repo = root.path().join("recovery");
+    let authority_path = root.path().join("authority");
+    let state = root.path().join("state");
+    git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+    git(
+        root.path(),
+        &["init", "-b", "main", first_repo.to_str().unwrap()],
+    );
+    git(&first_repo, &["config", "user.email", "pando@example.test"]);
+    git(&first_repo, &["config", "user.name", "Pando Test"]);
+    fs::write(first_repo.join("base.txt"), "absorbed by Git\n").unwrap();
+    git(&first_repo, &["add", "base.txt"]);
+    git(&first_repo, &["commit", "-m", "base"]);
+    git(
+        &first_repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&first_repo, &["push", "-u", "origin", "main"]);
+    fs::write(first_repo.join("dirty.txt"), "only in Pando\n").unwrap();
+
+    let mut authority = FileAuthority::open(&authority_path).unwrap();
+    let first = Trunk::open_with_state(&first_repo, "compact-repo", "macbook", state.join("first"))
+        .unwrap();
+    first.push(&mut authority, &VirtualClock::at(100)).unwrap();
+    first.release(&mut authority).unwrap();
+    let head = authority.head("compact-repo").unwrap().unwrap();
+    let overlay = authority.overlay(&head).unwrap();
+    let base_chunk = &overlay.snapshot.files["base.txt"].chunk;
+    assert!(!overlay.upserts.contains_key("base.txt"));
+    assert!(overlay.upserts.contains_key("dirty.txt"));
+    assert!(!authority.has_chunk(base_chunk).unwrap());
+    authority
+        .put_chunk(base_chunk, b"absorbed by Git\n")
+        .unwrap();
+    let compacted = authority.garbage_collect(true).unwrap();
+    assert!(compacted.chunks >= 1);
+    assert!(!authority.has_chunk(base_chunk).unwrap());
+    authority.verify().unwrap();
+
+    fs::create_dir(&second_repo).unwrap();
+    let second =
+        Trunk::open_with_state(&second_repo, "compact-repo", "second", state.join("second"))
+            .unwrap();
+    second.pull(&authority, &VirtualClock::at(200)).unwrap();
+    assert_eq!(
+        fs::read_to_string(second_repo.join("base.txt")).unwrap(),
+        "absorbed by Git\n"
+    );
+    assert_eq!(
+        fs::read_to_string(second_repo.join("dirty.txt")).unwrap(),
+        "only in Pando\n"
+    );
+
+    let restored = root.path().join("restored");
+    authority.restore(&head, &restored).unwrap();
+    assert_eq!(
+        fs::read_to_string(restored.join("base.txt")).unwrap(),
+        "absorbed by Git\n"
+    );
+
+    let key = TransportKey::from_bytes([9; 32]);
+    let escape = pando::escape::export(
+        &first_repo,
+        "compact-repo",
+        &authority,
+        &key,
+        Some("origin"),
+    )
+    .unwrap();
+    git(
+        root.path(),
+        &["init", "-b", "main", recovery_repo.to_str().unwrap()],
+    );
+    git(
+        &recovery_repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    pando::escape::fetch_ref(&recovery_repo, "origin", &escape.reference).unwrap();
+    let escaped = root.path().join("escaped");
+    pando::escape::restore(&recovery_repo, &escape.reference, &key, &escaped).unwrap();
+    assert_eq!(
+        fs::read_to_string(escaped.join("base.txt")).unwrap(),
+        "absorbed by Git\n"
+    );
+    assert_eq!(
+        fs::read_to_string(escaped.join("dirty.txt")).unwrap(),
+        "only in Pando\n"
+    );
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")

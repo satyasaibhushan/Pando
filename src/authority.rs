@@ -188,7 +188,7 @@ impl FileAuthority {
 
         let mut referenced = BTreeSet::new();
         for overlay in overlays.values() {
-            for entry in overlay.snapshot.files.values() {
+            for entry in overlay.upserts.values() {
                 if referenced.insert(&entry.chunk) {
                     let bytes = self.chunks.get(&entry.chunk)?;
                     if bytes.len() as u64 != entry.size {
@@ -237,17 +237,48 @@ impl FileAuthority {
             bail!("restore staging path already exists: {}", staging.display());
         }
         fs::create_dir(&staging)?;
+        let chunk_staging = parent.join(format!(
+            ".{name}.pando-restore-chunks-{}",
+            std::process::id()
+        ));
+        if chunk_staging.exists() {
+            bail!(
+                "restore chunk staging path already exists: {}",
+                chunk_staging.display()
+            );
+        }
+        let restore_chunks = ChunkStore::new(&chunk_staging)?;
+        for entry in overlay.upserts.values() {
+            restore_chunks.put_verified(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+        }
+        if let Some(commit) = overlay.snapshot.base_commit.as_deref() {
+            let git_overlay = Overlay {
+                snapshot: overlay.snapshot.clone(),
+                upserts: overlay
+                    .upserts
+                    .iter()
+                    .filter(|(path, _)| *path == ".git" || path.starts_with(".git/"))
+                    .map(|(path, entry)| (path.clone(), entry.clone()))
+                    .collect(),
+                deletes: Vec::new(),
+            };
+            materialize_overlay(&staging, &git_overlay, &restore_chunks)?;
+            crate::git::baseline(&staging, commit, &restore_chunks)?;
+        }
         let restored = Overlay {
             snapshot: overlay.snapshot.clone(),
             upserts: overlay.snapshot.files.clone(),
             deletes: Vec::new(),
         };
-        materialize_overlay(&staging, &restored, &self.chunks).with_context(|| {
-            format!(
-                "restore failed; partial files remain at {}",
-                staging.display()
-            )
-        })?;
+        let materialized =
+            materialize_overlay(&staging, &restored, &restore_chunks).with_context(|| {
+                format!(
+                    "restore failed; partial files remain at {}",
+                    staging.display()
+                )
+            });
+        let _ = fs::remove_dir_all(&chunk_staging);
+        materialized?;
         fs::rename(&staging, &destination)?;
         Ok(RestoreReport {
             snapshot: overlay.snapshot.id,
@@ -303,13 +334,7 @@ impl FileAuthority {
         let retained_chunks: BTreeSet<_> = overlays
             .iter()
             .filter(|(snapshot, _)| reachable.contains(*snapshot))
-            .flat_map(|(_, overlay)| {
-                overlay
-                    .snapshot
-                    .files
-                    .values()
-                    .map(|entry| entry.chunk.clone())
-            })
+            .flat_map(|(_, overlay)| overlay.upserts.values().map(|entry| entry.chunk.clone()))
             .collect();
         let inventory = self.chunks.inventory()?;
         let unreferenced: Vec<_> = inventory
@@ -381,6 +406,15 @@ fn verify_overlay_shape(overlay: &Overlay) -> Result<()> {
             bail!("snapshot {} has invalid upsert {path}", overlay.snapshot.id);
         }
     }
+    for (path, entry) in &overlay.snapshot.files {
+        if (path == ".git" || path.starts_with(".git/")) && overlay.upserts.get(path) != Some(entry)
+        {
+            bail!(
+                "snapshot {} must retain Git metadata upsert {path}",
+                overlay.snapshot.id
+            );
+        }
+    }
     let mut deletes = BTreeSet::new();
     for path in &overlay.deletes {
         validate_snapshot_path(path)?;
@@ -433,7 +467,7 @@ fn validate_overlay(overlay: &Overlay, chunks: &ChunkStore) -> Result<()> {
         );
     }
     verify_overlay_shape(overlay)?;
-    for entry in overlay.snapshot.files.values() {
+    for entry in overlay.upserts.values() {
         if !chunks.contains(&entry.chunk) {
             bail!("snapshot references missing chunk {}", entry.chunk);
         }
