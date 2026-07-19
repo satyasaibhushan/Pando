@@ -1,11 +1,13 @@
 use crate::model::{Lease, Overlay, SnapshotId};
+use crate::snapshot::manifest_id;
+use crate::snapshot::materialize_overlay;
 use crate::store::ChunkStore;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AcquireResult {
@@ -20,6 +22,21 @@ pub struct AuthorityStatus {
     pub head: Option<SnapshotId>,
     pub last_snapshot_at_ms: Option<u64>,
     pub exposure_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityVerification {
+    pub heads: usize,
+    pub overlays: usize,
+    pub chunks: usize,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub snapshot: SnapshotId,
+    pub files: usize,
+    pub bytes: u64,
 }
 
 pub trait Authority {
@@ -65,8 +82,168 @@ impl FileAuthority {
         Ok(authority)
     }
 
+    pub fn open_existing(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        if !root.join("state.json").is_file() || !root.join("overlays").is_dir() {
+            bail!("authority does not exist at {}", root.display());
+        }
+        let chunks = ChunkStore::open_existing(root.join("chunks"))?;
+        Ok(Self { root, chunks })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn verify(&self) -> Result<AuthorityVerification> {
+        let store = self.chunks.verify_all()?;
+        let mut overlays = BTreeMap::new();
+        for entry in fs::read_dir(self.root.join("overlays"))? {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with('.') && name.contains(".partial-"))
+            {
+                continue;
+            }
+            if !entry.file_type()?.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                bail!("unexpected authority overlay entry {}", path.display());
+            }
+            let bytes = fs::read(&path)?;
+            let overlay: Overlay = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse overlay {}", path.display()))?;
+            let file_id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("overlay file name is not valid UTF-8")?;
+            if overlay.snapshot.id != file_id {
+                bail!(
+                    "overlay file {} contains snapshot {}",
+                    path.display(),
+                    overlay.snapshot.id
+                );
+            }
+            let actual_id = manifest_id(&overlay.snapshot)?;
+            if actual_id != overlay.snapshot.id {
+                bail!(
+                    "snapshot {} content hashes to {actual_id}",
+                    overlay.snapshot.id
+                );
+            }
+            verify_overlay_shape(&overlay)?;
+            if overlays.insert(file_id.to_owned(), overlay).is_some() {
+                bail!("duplicate overlay {file_id}");
+            }
+        }
+
+        for (id, overlay) in &overlays {
+            if let Some(parent) = &overlay.snapshot.parent
+                && !overlays.contains_key(parent)
+            {
+                bail!("snapshot {id} references missing parent {parent}");
+            }
+            let mut ancestry = BTreeSet::new();
+            let mut cursor = Some(id.as_str());
+            while let Some(current) = cursor {
+                if !ancestry.insert(current) {
+                    bail!("snapshot ancestry cycle at {current}");
+                }
+                cursor = overlays
+                    .get(current)
+                    .and_then(|value| value.snapshot.parent.as_deref());
+            }
+        }
+
+        let state = self.load_state()?;
+        for (repo_id, head) in &state.heads {
+            let overlay = overlays
+                .get(head)
+                .with_context(|| format!("repository {repo_id} references missing head {head}"))?;
+            if overlay.snapshot.repo_id != *repo_id {
+                bail!(
+                    "repository {repo_id} head {head} belongs to {}",
+                    overlay.snapshot.repo_id
+                );
+            }
+        }
+
+        let mut referenced = BTreeSet::new();
+        for overlay in overlays.values() {
+            for entry in overlay.snapshot.files.values() {
+                if referenced.insert(&entry.chunk) {
+                    let bytes = self.chunks.get(&entry.chunk)?;
+                    if bytes.len() as u64 != entry.size {
+                        bail!(
+                            "chunk {} has {} bytes but manifest records {}",
+                            entry.chunk,
+                            bytes.len(),
+                            entry.size
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(AuthorityVerification {
+            heads: state.heads.len(),
+            overlays: overlays.len(),
+            chunks: store.chunks,
+            bytes: store.bytes,
+        })
+    }
+
+    pub fn restore(&self, snapshot_id: &str, destination: &Path) -> Result<RestoreReport> {
+        let destination = if destination.is_absolute() {
+            destination.to_owned()
+        } else {
+            std::env::current_dir()?.join(destination)
+        };
+        if destination.exists() {
+            bail!(
+                "restore destination already exists: {}",
+                destination.display()
+            );
+        }
+        let overlay = self.overlay(snapshot_id)?;
+        let parent = destination
+            .parent()
+            .context("restore destination has no parent")?;
+        fs::create_dir_all(parent)?;
+        let name = destination
+            .file_name()
+            .context("restore destination has no file name")?
+            .to_string_lossy();
+        let staging = parent.join(format!(".{name}.pando-restore-{}", std::process::id()));
+        if staging.exists() {
+            bail!("restore staging path already exists: {}", staging.display());
+        }
+        fs::create_dir(&staging)?;
+        let restored = Overlay {
+            snapshot: overlay.snapshot.clone(),
+            upserts: overlay.snapshot.files.clone(),
+            deletes: Vec::new(),
+        };
+        materialize_overlay(&staging, &restored, &self.chunks).with_context(|| {
+            format!(
+                "restore failed; partial files remain at {}",
+                staging.display()
+            )
+        })?;
+        fs::rename(&staging, &destination)?;
+        Ok(RestoreReport {
+            snapshot: overlay.snapshot.id,
+            files: overlay.snapshot.files.len(),
+            bytes: overlay
+                .snapshot
+                .files
+                .values()
+                .map(|entry| entry.size)
+                .sum(),
+        })
     }
 
     fn load_state(&self) -> Result<State> {
@@ -85,6 +262,73 @@ impl FileAuthority {
     fn overlay_path(&self, id: &str) -> PathBuf {
         self.root.join("overlays").join(format!("{id}.json"))
     }
+}
+
+fn verify_overlay_shape(overlay: &Overlay) -> Result<()> {
+    let symlinks: BTreeSet<_> = overlay
+        .snapshot
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.kind == crate::model::FileKind::Symlink)
+        .map(|(path, _)| Path::new(path))
+        .collect();
+    for path in overlay.snapshot.files.keys() {
+        validate_snapshot_path(path)?;
+        if Path::new(path)
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| symlinks.contains(ancestor))
+        {
+            bail!(
+                "snapshot {} contains a path below a symlink: {path}",
+                overlay.snapshot.id
+            );
+        }
+    }
+    for (path, entry) in &overlay.upserts {
+        validate_snapshot_path(path)?;
+        if overlay.snapshot.files.get(path) != Some(entry) {
+            bail!("snapshot {} has invalid upsert {path}", overlay.snapshot.id);
+        }
+    }
+    let mut deletes = BTreeSet::new();
+    for path in &overlay.deletes {
+        validate_snapshot_path(path)?;
+        if !deletes.insert(path) {
+            bail!("snapshot {} repeats delete {path}", overlay.snapshot.id);
+        }
+        if overlay.snapshot.files.contains_key(path) {
+            bail!(
+                "snapshot {} both contains and deletes {path}",
+                overlay.snapshot.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_path(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+        || path.components().next() == Some(Component::Normal(".pando".as_ref()))
+    {
+        bail!("unsafe snapshot path {value:?}");
+    }
+    Ok(())
+}
+
+fn valid_object_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl Authority for FileAuthority {
@@ -147,6 +391,17 @@ impl Authority for FileAuthority {
     }
 
     fn publish(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()> {
+        if !valid_object_id(&overlay.snapshot.id) {
+            bail!("invalid snapshot id {:?}", overlay.snapshot.id);
+        }
+        let actual_id = manifest_id(&overlay.snapshot)?;
+        if actual_id != overlay.snapshot.id {
+            bail!(
+                "snapshot {} content hashes to {actual_id}",
+                overlay.snapshot.id
+            );
+        }
+        verify_overlay_shape(overlay)?;
         let mut state = self.load_state()?;
         let lease = state
             .leases
@@ -182,9 +437,24 @@ impl Authority for FileAuthority {
     }
 
     fn overlay(&self, snapshot_id: &str) -> Result<Overlay> {
+        if !valid_object_id(snapshot_id) {
+            bail!("invalid snapshot id {snapshot_id:?}");
+        }
         let bytes = fs::read(self.overlay_path(snapshot_id))
             .with_context(|| format!("read overlay {snapshot_id}"))?;
-        serde_json::from_slice(&bytes).context("parse overlay")
+        let overlay: Overlay = serde_json::from_slice(&bytes).context("parse overlay")?;
+        if overlay.snapshot.id != snapshot_id {
+            bail!(
+                "overlay {snapshot_id} contains snapshot {}",
+                overlay.snapshot.id
+            );
+        }
+        let actual_id = manifest_id(&overlay.snapshot)?;
+        if actual_id != snapshot_id {
+            bail!("snapshot {snapshot_id} content hashes to {actual_id}");
+        }
+        verify_overlay_shape(&overlay)?;
+        Ok(overlay)
     }
 
     fn status(&self, repo_id: &str, now_ms: u64) -> Result<AuthorityStatus> {
