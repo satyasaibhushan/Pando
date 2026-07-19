@@ -181,3 +181,5 @@ pando restore \
 The destination must not already exist. Pando materializes into a sibling staging directory, verifies content hashes while reading, and renames the completed tree into place. It refuses unsafe paths, reserved `.pando/` state, and paths that would traverse symlink ancestors.
 
 Pando captures the portable repository—including `.git`—while preserving classified derived and local-only state independently on each machine. Opt-in npm/uv rehydration, authority verification, and restore-to-new-tree are implemented; fork reconciliation, broader recipe coverage, artifact caching, and scheduled real-repository restore drills remain Phase 1 work, so continue dogfooding on disposable clones before valuable repositories.
+
+On macOS and Windows, Pando refuses a snapshot containing paths that differ only by case before materialization begins. This protects case-insensitive filesystems from silently aliasing and overwriting portable files created on a case-sensitive machine.

@@ -190,6 +190,7 @@ pub fn materialization_delta(
 }
 
 pub fn materialize_overlay(repo: &Path, overlay: &Overlay, store: &ChunkStore) -> Result<()> {
+    validate_case_collisions(&overlay.snapshot.files)?;
     fs::create_dir_all(repo)?;
     for path in &overlay.deletes {
         let destination = checked_destination(repo, path)?;
@@ -210,6 +211,26 @@ pub fn materialize_overlay(repo: &Path, overlay: &Overlay, store: &ChunkStore) -
             FileKind::Symlink => create_symlink(&destination, &bytes)?,
         }
     }
+    Ok(())
+}
+
+fn validate_case_collisions(files: &BTreeMap<String, FileEntry>) -> Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let mut folded = BTreeMap::<String, &str>::new();
+        for path in files.keys() {
+            let key = path.to_lowercase();
+            if let Some(previous) = folded.insert(key, path)
+                && previous != path
+            {
+                bail!(
+                    "snapshot paths {previous:?} and {path:?} collide on this case-insensitive platform"
+                );
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = files;
     Ok(())
 }
 

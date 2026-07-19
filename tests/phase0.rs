@@ -3,6 +3,7 @@ use pando::authority::{AcquireResult, Authority, FileAuthority};
 use pando::clock::{SystemClock, VirtualClock};
 use pando::model::{FileEntry, FileKind, Manifest, Overlay};
 use pando::snapshot::manifest_id;
+use pando::store::ChunkStore;
 use pando::sync::{PullResult, PushResult, Trunk};
 use pando::transport::{RemoteAuthority, TransportKey};
 use std::collections::BTreeMap;
@@ -1481,6 +1482,56 @@ fn encrypted_escape_ref_restores_without_the_authority() {
         .to_string()
         .contains("authentication failed")
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn materialization_refuses_case_colliding_snapshot_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ChunkStore::new(root.path().join("chunks")).unwrap();
+    let lower = store.put(b"lower\n").unwrap();
+    let upper = store.put(b"upper\n").unwrap();
+    let files = BTreeMap::from([
+        (
+            "Readme".to_owned(),
+            FileEntry {
+                chunk: lower,
+                size: 6,
+                kind: FileKind::Regular,
+                executable: false,
+            },
+        ),
+        (
+            "README".to_owned(),
+            FileEntry {
+                chunk: upper,
+                size: 6,
+                kind: FileKind::Regular,
+                executable: false,
+            },
+        ),
+    ]);
+    let mut manifest = Manifest {
+        id: String::new(),
+        repo_id: "repo".into(),
+        trunk_id: "linux".into(),
+        created_at_ms: 1,
+        parent: None,
+        base_commit: None,
+        classification_version: 1,
+        ignore_patterns: Vec::new(),
+        files: files.clone(),
+    };
+    manifest.id = manifest_id(&manifest).unwrap();
+    let overlay = Overlay {
+        snapshot: manifest,
+        upserts: files,
+        deletes: Vec::new(),
+    };
+    let destination = root.path().join("destination");
+    let error = pando::materialize_overlay(&destination, &overlay, &store).unwrap_err();
+    assert!(error.to_string().contains("collide"));
+    assert!(!destination.exists());
 }
 
 fn git(cwd: &Path, args: &[&str]) {
