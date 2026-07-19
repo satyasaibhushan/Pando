@@ -38,6 +38,10 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    Escape {
+        #[command(subcommand)]
+        command: EscapeCommand,
+    },
     Reconcile {
         #[command(flatten)]
         trunk: TrunkArgs,
@@ -82,6 +86,10 @@ enum Command {
         full_scan_secs: u64,
         #[arg(long, default_value_t = 30)]
         fetch_secs: u64,
+        #[arg(long, default_value_t = 600)]
+        escape_secs: u64,
+        #[arg(long, default_value = "origin")]
+        escape_remote: String,
         #[arg(long)]
         rehydrate: bool,
     },
@@ -104,6 +112,32 @@ enum Command {
     Demo {
         #[arg(long, default_value = ".pando-demo")]
         root: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscapeCommand {
+    Export {
+        #[command(flatten)]
+        trunk: TrunkArgs,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long)]
+        local_only: bool,
+    },
+    Restore {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        repo_id: String,
+        #[arg(long)]
+        trunk_id: String,
+        #[arg(long, env = "PANDO_KEY")]
+        key: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        fetch_remote: Option<String>,
     },
 }
 
@@ -188,6 +222,60 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Escape { command } => match command {
+            EscapeCommand::Export {
+                trunk,
+                remote,
+                local_only,
+            } => {
+                let key_path = trunk
+                    .key
+                    .as_deref()
+                    .context("escape export requires --key or PANDO_KEY")?;
+                let key = TransportKey::load(key_path)?;
+                let authority = authority(&trunk.authority, trunk.key.as_deref())?;
+                let report = pando::escape::export(
+                    &trunk.repo,
+                    &trunk.repo_id,
+                    authority.as_ref(),
+                    &key,
+                    (!local_only).then_some(remote.as_str()),
+                )?;
+                println!(
+                    "{} {} chunks ({} bytes) from {} in {}{}",
+                    if report.reused { "reused" } else { "encrypted" },
+                    report.chunks,
+                    report.bytes,
+                    report.snapshot,
+                    report.reference,
+                    if report.pushed { " and pushed it" } else { "" }
+                );
+                Ok(())
+            }
+            EscapeCommand::Restore {
+                repo,
+                repo_id,
+                trunk_id,
+                key,
+                destination,
+                fetch_remote,
+            } => {
+                let key = TransportKey::load(key)?;
+                let reference = pando::escape::reference(&repo_id, &trunk_id);
+                if let Some(remote) = fetch_remote {
+                    pando::escape::fetch_ref(&repo, &remote, &reference)?;
+                }
+                let report = pando::escape::restore(&repo, &reference, &key, &destination)?;
+                println!(
+                    "restored {} files ({} bytes) from encrypted snapshot {} to {}",
+                    report.files,
+                    report.bytes,
+                    report.snapshot,
+                    destination.display()
+                );
+                Ok(())
+            }
+        },
         Command::Reconcile {
             trunk,
             fork,
@@ -281,8 +369,14 @@ fn main() -> Result<()> {
             idle_ms,
             full_scan_secs,
             fetch_secs,
+            escape_secs,
+            escape_remote,
             rehydrate,
         } => {
+            let escape_key = trunk.key.as_deref().map(TransportKey::load).transpose()?;
+            if escape_secs > 0 && escape_key.is_none() {
+                eprintln!("escape export disabled: provide --key or PANDO_KEY");
+            }
             let authority = authority(&trunk.authority, trunk.key.as_deref())?;
             let trunk = open_trunk(&trunk)?;
             pando::daemon::watch(
@@ -293,6 +387,13 @@ fn main() -> Result<()> {
                     idle_release: Duration::from_millis(idle_ms),
                     full_scan_interval: Duration::from_secs(full_scan_secs),
                     fetch_interval: Duration::from_secs(fetch_secs),
+                    escape_interval: if escape_key.is_some() {
+                        Duration::from_secs(escape_secs)
+                    } else {
+                        Duration::ZERO
+                    },
+                    escape_key,
+                    escape_remote: Some(escape_remote),
                     rehydrate,
                     ..WatchOptions::default()
                 },

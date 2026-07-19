@@ -89,6 +89,10 @@ impl TransportKey {
         blake3::hash(&self.0).to_hex()[..12].to_owned()
     }
 
+    pub(crate) fn derive_key(&self, context: &str) -> [u8; 32] {
+        blake3::derive_key(context, &self.0)
+    }
+
     fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

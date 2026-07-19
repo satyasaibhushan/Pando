@@ -52,6 +52,14 @@ The watcher performs a complete classified-tree scan every 60 seconds as a backs
 
 For Git repositories, the watcher also runs `git fetch --all --prune` every 30 seconds on a background thread. It updates remote-tracking refs but never checks out, merges, rebases, or pulls. Use `--fetch-secs 0` to disable it or run `pando fetch --repo ~/Code/project` explicitly. Because `.git` is portable state, refreshed remote-tracking refs follow the repository to other trunks. When a remote ref is force-pushed, Pando pins the previous commit under a local `refs/pando/rescue/...` ref so Git garbage collection cannot discard its commit and tree metadata; complete snapshot file content is already retained in Pando's chunk store.
 
+With `--key` or `PANDO_KEY`, the watcher also publishes an authenticated encrypted copy of the latest complete snapshot to a hidden `refs/pando/escape/...` ref on `origin` every 10 minutes. Set `--escape-secs 0` to disable this or use `pando escape export ...` on demand; `--local-only` retains the ref without pushing it. Repeated exports of the same snapshot reuse the existing commit. The separate `pando-restore` executable can fetch that ref and restore into a new destination using only a Git repository, the repository/trunk IDs, and the key—no Pando authority is needed:
+
+```console
+pando-restore --repo . --repo-id my-project --trunk-id macbook \
+  --key ~/.config/pando/fabric.key --fetch-remote origin \
+  --destination ../my-project-recovered
+```
+
 ```sh
 pando watch \
   --repo ~/Code/project \

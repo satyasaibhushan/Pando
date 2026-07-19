@@ -2,6 +2,7 @@ pub mod authority;
 pub mod classify;
 pub mod clock;
 pub mod daemon;
+pub mod escape;
 pub mod git;
 pub mod model;
 pub mod rehydrate;

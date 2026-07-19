@@ -1391,6 +1391,98 @@ fn fetch_reports_fast_forward_and_forced_remote_movement() {
     );
 }
 
+#[test]
+fn encrypted_escape_ref_restores_without_the_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let remote = root.path().join("remote.git");
+    let authority_path = root.path().join("authority");
+    let state = root.path().join("state");
+    let recovery_repo = root.path().join("recovery");
+    let restored = root.path().join("restored");
+    git(root.path(), &["init", "-b", "main", repo.to_str().unwrap()]);
+    git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    fs::write(repo.join("unfinished.txt"), "secret working tree\n").unwrap();
+
+    let mut authority = FileAuthority::open(&authority_path).unwrap();
+    let trunk = Trunk::open_with_state(&repo, "escape-repo", "macbook", state).unwrap();
+    trunk.push(&mut authority, &VirtualClock::at(42)).unwrap();
+    trunk.release(&mut authority).unwrap();
+    let key = TransportKey::from_bytes([7; 32]);
+    let report =
+        pando::escape::export(&repo, "escape-repo", &authority, &key, Some("origin")).unwrap();
+    assert!(report.pushed);
+    assert_eq!(
+        git_output(&remote, &["rev-parse", &report.reference]).len(),
+        40
+    );
+    let encrypted = Command::new("git")
+        .arg("-C")
+        .arg(&remote)
+        .args(["show", &format!("{}:snapshot.pando", report.reference)])
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(
+        !encrypted
+            .windows(b"secret working tree".len())
+            .any(|window| window == b"secret working tree")
+    );
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "--verify", &report.reference])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let remote_commit = git_output(&remote, &["rev-parse", &report.reference]);
+    let reused =
+        pando::escape::export(&repo, "escape-repo", &authority, &key, Some("origin")).unwrap();
+    assert!(reused.reused);
+    assert_eq!(
+        git_output(&remote, &["rev-parse", &report.reference]),
+        remote_commit
+    );
+
+    fs::remove_dir_all(&authority_path).unwrap();
+    git(
+        root.path(),
+        &["init", "-b", "main", recovery_repo.to_str().unwrap()],
+    );
+    git(
+        &recovery_repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    pando::escape::fetch_ref(&recovery_repo, "origin", &report.reference).unwrap();
+    let restored_report =
+        pando::escape::restore(&recovery_repo, &report.reference, &key, &restored).unwrap();
+    assert_eq!(restored_report.snapshot, report.snapshot);
+    assert_eq!(
+        fs::read_to_string(restored.join("unfinished.txt")).unwrap(),
+        "secret working tree\n"
+    );
+    let wrong_key = TransportKey::from_bytes([8; 32]);
+    assert!(
+        pando::escape::restore(
+            &recovery_repo,
+            &report.reference,
+            &wrong_key,
+            &root.path().join("wrong-key")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("authentication failed")
+    );
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")

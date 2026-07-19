@@ -4,6 +4,7 @@ use crate::clock::SystemClock;
 use crate::model::short_id;
 use crate::rehydrate::Hydrator;
 use crate::sync::{PullResult, PushResult, Trunk};
+use crate::transport::TransportKey;
 use anyhow::Result;
 use notify::{Event, RecursiveMode, Watcher};
 use std::sync::{
@@ -19,6 +20,9 @@ pub struct WatchOptions {
     pub poll_interval: Duration,
     pub full_scan_interval: Duration,
     pub fetch_interval: Duration,
+    pub escape_interval: Duration,
+    pub escape_key: Option<TransportKey>,
+    pub escape_remote: Option<String>,
     pub rehydrate: bool,
 }
 
@@ -30,6 +34,9 @@ impl Default for WatchOptions {
             poll_interval: Duration::from_secs(1),
             full_scan_interval: Duration::from_secs(60),
             fetch_interval: Duration::from_secs(30),
+            escape_interval: Duration::ZERO,
+            escape_key: None,
+            escape_remote: None,
             rehydrate: false,
         }
     }
@@ -64,6 +71,7 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
     let mut last_poll = Instant::now();
     let mut last_full_scan = Instant::now();
     let mut last_fetch = Instant::now();
+    let mut last_escape = Instant::now();
     let fetch_running = Arc::new(AtomicBool::new(false));
     let (fetch_sender, fetch_receiver) = mpsc::channel::<Result<crate::git::FetchReport>>();
     let mut lease_released = true;
@@ -103,6 +111,32 @@ pub fn watch(trunk: Trunk, mut authority: Box<dyn Authority>, options: WatchOpti
                 let _ = sender.send(crate::git::fetch_remotes(&repo));
             });
             last_fetch = Instant::now();
+        }
+        if dirty_at.is_none()
+            && !options.escape_interval.is_zero()
+            && last_escape.elapsed() >= options.escape_interval
+        {
+            if let Some(key) = options.escape_key.as_ref() {
+                match crate::escape::export(
+                    trunk.repo(),
+                    trunk.repo_id(),
+                    authority.as_ref(),
+                    key,
+                    options.escape_remote.as_deref(),
+                ) {
+                    Ok(report) if report.reused => {
+                        println!("escape ref already protects {}", short_id(&report.snapshot));
+                    }
+                    Ok(report) => println!(
+                        "escape ref {} protects {} ({} encrypted bytes)",
+                        report.reference,
+                        short_id(&report.snapshot),
+                        report.bytes
+                    ),
+                    Err(error) => eprintln!("escape export failed: {error:#}"),
+                }
+            }
+            last_escape = Instant::now();
         }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(event)) => {
