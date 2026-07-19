@@ -162,6 +162,14 @@ enum Request {
         trunk_id: String,
         now_ms: u64,
     },
+    PublishFork {
+        overlay: Overlay,
+        trunk_id: String,
+        now_ms: u64,
+    },
+    Forks {
+        repo_id: String,
+    },
     Head {
         repo_id: String,
     },
@@ -182,6 +190,7 @@ enum Response {
     Bytes(Vec<u8>),
     Head(Option<SnapshotId>),
     Overlay(Overlay),
+    Forks(Vec<SnapshotId>),
     Status(AuthorityStatus),
     Error(String),
 }
@@ -285,6 +294,23 @@ impl Authority for RemoteAuthority {
         })?)
     }
 
+    fn publish_fork(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()> {
+        expect_ok(self.rpc(Request::PublishFork {
+            overlay: overlay.clone(),
+            trunk_id: trunk_id.into(),
+            now_ms,
+        })?)
+    }
+
+    fn forks(&self, repo_id: &str) -> Result<Vec<SnapshotId>> {
+        match self.rpc(Request::Forks {
+            repo_id: repo_id.into(),
+        })? {
+            Response::Forks(forks) => Ok(forks),
+            _ => bail!("unexpected forks response"),
+        }
+    }
+
     fn head(&self, repo_id: &str) -> Result<Option<SnapshotId>> {
         match self.rpc(Request::Head {
             repo_id: repo_id.into(),
@@ -384,6 +410,15 @@ fn dispatch(request: Request, authority: &Arc<Mutex<FileAuthority>>) -> Response
                 authority.publish(&overlay, &trunk_id, now_ms)?;
                 Response::Ok
             }
+            Request::PublishFork {
+                overlay,
+                trunk_id,
+                now_ms,
+            } => {
+                authority.publish_fork(&overlay, &trunk_id, now_ms)?;
+                Response::Ok
+            }
+            Request::Forks { repo_id } => Response::Forks(authority.forks(&repo_id)?),
             Request::Head { repo_id } => Response::Head(authority.head(&repo_id)?),
             Request::Overlay { snapshot_id } => Response::Overlay(authority.overlay(&snapshot_id)?),
             Request::Status { repo_id, now_ms } => {

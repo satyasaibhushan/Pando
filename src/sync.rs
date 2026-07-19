@@ -36,6 +36,7 @@ pub enum PushResult {
     Conflicted {
         local_head: SnapshotId,
         authority_head: SnapshotId,
+        fork: SnapshotId,
         paths: Vec<String>,
     },
 }
@@ -154,9 +155,17 @@ impl Trunk {
                 let (merged, conflicts) =
                     three_way_files(&base.snapshot.files, &local.files, &remote.snapshot.files);
                 if !conflicts.is_empty() {
+                    let fork_overlay = overlay_against(&self.repo, local, &self.chunks)?;
+                    for entry in fork_overlay.snapshot.files.values() {
+                        if !authority.has_chunk(&entry.chunk)? {
+                            authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+                        }
+                    }
+                    authority.publish_fork(&fork_overlay, &self.trunk_id, now_ms)?;
                     return Ok(PushResult::Conflicted {
                         local_head,
                         authority_head,
+                        fork: fork_overlay.snapshot.id,
                         paths: conflicts,
                     });
                 }

@@ -160,9 +160,11 @@ pub fn describe_push(result: &PushResult) -> String {
         PushResult::Conflicted {
             local_head,
             authority_head,
+            fork,
             paths,
         } => format!(
-            "reconcile required: local {} and authority {} both changed {}",
+            "reconcile required: fork {} preserves local {}; authority {}; both changed {}",
+            short_id(fork),
             short_id(local_head),
             short_id(authority_head),
             paths.join(", ")

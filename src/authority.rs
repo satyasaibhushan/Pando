@@ -52,6 +52,8 @@ pub trait Authority {
     fn has_chunk(&self, hash: &str) -> Result<bool>;
     fn get_chunk(&self, hash: &str) -> Result<Vec<u8>>;
     fn publish(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()>;
+    fn publish_fork(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()>;
+    fn forks(&self, repo_id: &str) -> Result<Vec<SnapshotId>>;
     fn head(&self, repo_id: &str) -> Result<Option<SnapshotId>>;
     fn overlay(&self, snapshot_id: &str) -> Result<Overlay>;
     fn status(&self, repo_id: &str, now_ms: u64) -> Result<AuthorityStatus>;
@@ -68,6 +70,8 @@ struct State {
     heads: BTreeMap<String, SnapshotId>,
     leases: BTreeMap<String, Lease>,
     generations: BTreeMap<String, u64>,
+    #[serde(default)]
+    forks: BTreeMap<String, Vec<SnapshotId>>,
 }
 
 impl FileAuthority {
@@ -331,6 +335,26 @@ fn valid_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn validate_overlay(overlay: &Overlay, chunks: &ChunkStore) -> Result<()> {
+    if !valid_object_id(&overlay.snapshot.id) {
+        bail!("invalid snapshot id {:?}", overlay.snapshot.id);
+    }
+    let actual_id = manifest_id(&overlay.snapshot)?;
+    if actual_id != overlay.snapshot.id {
+        bail!(
+            "snapshot {} content hashes to {actual_id}",
+            overlay.snapshot.id
+        );
+    }
+    verify_overlay_shape(overlay)?;
+    for entry in overlay.snapshot.files.values() {
+        if !chunks.contains(&entry.chunk) {
+            bail!("snapshot references missing chunk {}", entry.chunk);
+        }
+    }
+    Ok(())
+}
+
 impl Authority for FileAuthority {
     fn acquire(
         &mut self,
@@ -391,17 +415,7 @@ impl Authority for FileAuthority {
     }
 
     fn publish(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()> {
-        if !valid_object_id(&overlay.snapshot.id) {
-            bail!("invalid snapshot id {:?}", overlay.snapshot.id);
-        }
-        let actual_id = manifest_id(&overlay.snapshot)?;
-        if actual_id != overlay.snapshot.id {
-            bail!(
-                "snapshot {} content hashes to {actual_id}",
-                overlay.snapshot.id
-            );
-        }
-        verify_overlay_shape(overlay)?;
+        validate_overlay(overlay, &self.chunks)?;
         let mut state = self.load_state()?;
         let lease = state
             .leases
@@ -418,11 +432,6 @@ impl Authority for FileAuthority {
                 overlay.snapshot.parent
             );
         }
-        for entry in overlay.snapshot.files.values() {
-            if !self.chunks.contains(&entry.chunk) {
-                bail!("snapshot references missing chunk {}", entry.chunk);
-            }
-        }
         atomic_json(&self.overlay_path(&overlay.snapshot.id), overlay)?;
         state.heads.insert(
             overlay.snapshot.repo_id.clone(),
@@ -430,6 +439,42 @@ impl Authority for FileAuthority {
         );
         self.save_state(&state)?;
         Ok(())
+    }
+
+    fn publish_fork(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()> {
+        let mut state = self.load_state()?;
+        let lease = state
+            .leases
+            .get(&overlay.snapshot.repo_id)
+            .context("cannot publish fork without a lease")?;
+        if lease.holder != trunk_id || lease.expires_at_ms <= now_ms {
+            bail!("write lease is not held by trunk {trunk_id}");
+        }
+        let parent = overlay
+            .snapshot
+            .parent
+            .as_deref()
+            .context("fork snapshot requires a parent")?;
+        self.overlay(parent)?;
+        validate_overlay(overlay, &self.chunks)?;
+        atomic_json(&self.overlay_path(&overlay.snapshot.id), overlay)?;
+        let forks = state
+            .forks
+            .entry(overlay.snapshot.repo_id.clone())
+            .or_default();
+        if !forks.contains(&overlay.snapshot.id) {
+            forks.push(overlay.snapshot.id.clone());
+        }
+        self.save_state(&state)
+    }
+
+    fn forks(&self, repo_id: &str) -> Result<Vec<SnapshotId>> {
+        Ok(self
+            .load_state()?
+            .forks
+            .get(repo_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn head(&self, repo_id: &str) -> Result<Option<SnapshotId>> {

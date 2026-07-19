@@ -519,10 +519,20 @@ fn stale_overlapping_edits_report_paths_without_overwriting_local_work() {
     fs::write(harness.second_path.join("shared.txt"), "second\n").unwrap();
 
     let result = second.push(&mut authority, &harness.clock).unwrap();
-    assert!(matches!(
-        result,
-        PushResult::Conflicted { paths, .. } if paths == ["shared.txt"]
-    ));
+    let fork = match result {
+        PushResult::Conflicted { paths, fork, .. } => {
+            assert_eq!(paths, ["shared.txt"]);
+            fork
+        }
+        result => panic!("unexpected push result: {result:?}"),
+    };
+    assert_eq!(
+        authority.forks("repo").unwrap().as_slice(),
+        std::slice::from_ref(&fork)
+    );
+    let fork_overlay = authority.overlay(&fork).unwrap();
+    let fork_chunk = &fork_overlay.snapshot.files["shared.txt"].chunk;
+    assert_eq!(authority.get_chunk(fork_chunk).unwrap(), b"second\n");
     assert_eq!(
         fs::read_to_string(harness.second_path.join("shared.txt")).unwrap(),
         "second\n"
