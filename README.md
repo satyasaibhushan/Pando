@@ -109,10 +109,16 @@ The result names the winning built-in, user-wide, or repository rule. `--directo
 
 ## Dependency rehydration
 
-Pando can rebuild classified dependency trees from portable manifests and lockfiles. The first Phase 1 runner recognizes root and nested projects with these exact recipes:
+Pando can rebuild classified dependency trees from portable manifests and lockfiles. The Phase 1 runner recognizes root and nested projects with these exact recipes:
 
 - `package.json` + `package-lock.json` → `npm ci`
+- `package.json` + `pnpm-lock.yaml` → `pnpm install --frozen-lockfile`
+- `package.json` + `yarn.lock` → `yarn install --frozen-lockfile`
+- `package.json` + `bun.lock` or `bun.lockb` → `bun install --frozen-lockfile`
 - `pyproject.toml` + `uv.lock` → `uv sync --frozen`
+- `pyproject.toml` + `poetry.lock` → `poetry install --no-interaction`
+- `Cargo.toml` + `Cargo.lock` → `cargo fetch --locked`
+- `go.mod` + `go.sum` → `go mod download`
 
 Run recipes explicitly:
 
@@ -190,6 +196,6 @@ pando restore \
 
 The destination must not already exist. Pando materializes into a sibling staging directory, verifies content hashes while reading, and renames the completed tree into place. It refuses unsafe paths, reserved `.pando/` state, and paths that would traverse symlink ancestors.
 
-Pando captures the portable repository—including `.git`—while preserving classified derived and local-only state independently on each machine. Opt-in npm/uv rehydration, authority verification, and restore-to-new-tree are implemented; fork reconciliation, broader recipe coverage, artifact caching, and scheduled real-repository restore drills remain Phase 1 work, so continue dogfooding on disposable clones before valuable repositories.
+Pando captures the portable repository—including `.git`—while preserving classified derived and local-only state independently on each machine. The code-level Phase 1 baseline now includes encrypted authenticated transport, classification, asynchronous multi-ecosystem rehydration, conflict forks and reconciliation, Git remote tracking and force-push rescue, encrypted Git escape recovery, integrity verification, safe restore, unreachable-data GC, and launchd/systemd packaging. Platform artifact caching and pushed-base history compaction remain engineering work. Weekly recovery drills, sustained sleep/wake use, all-repository dogfooding, and the two-week control experiment remain elapsed evidence gates; continue dogfooding on disposable clones before valuable repositories.
 
 On macOS and Windows, Pando refuses a snapshot containing paths that differ only by case before materialization begins. This protects case-insensitive filesystems from silently aliasing and overwriting portable files created on a case-sensitive machine.
