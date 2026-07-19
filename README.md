@@ -2,9 +2,7 @@
 
 Pando carries the state between your keyboard and the last push to every machine you use. Git remains history; Pando supplies presence.
 
-Phase 0 was a deliberately small proof: portable macOS and Linux trunks, one always-on authority, append-only whole-tree snapshots, pushed-ref overlays, leases that prevent concurrent writers, and hard refusal when two trunks diverge. It did not encrypt traffic or merge forks.
-
-The implementation and live two-Mac handoff are complete: dirty files, the active branch, index, and stash all materialized on the second machine. Phase 0 is closed; longer dogfooding and the remote-development control experiment move to Phase 1, after the security baseline is usable.
+Phase 0 proved the two-machine handoff. The Phase 1 implementation now has folder-first onboarding, encrypted transport, background watchers, Git-aware working-tree capture, safe first-join merging, and interactive conflict resolution. Real-machine dogfooding remains the release gate.
 
 ## Build and test
 
@@ -19,72 +17,44 @@ Run the deterministic local handoff demo:
 cargo run -- demo
 ```
 
-## Two-machine proof
+## Folder-first setup
 
-Generate one fabric key, then copy that file securely to every Pando machine. Key generation refuses to overwrite an existing key and creates it with mode `0600` on Unix:
-
-```sh
-pando keygen --output ~/.config/pando/fabric.key
-export PANDO_KEY=~/.config/pando/fabric.key
-```
-
-On the always-on machine, start the authority and allow TCP port 7337 through the local firewall:
+Build the release binary on both machines. On the always-on host, select one folder. Pando recursively discovers the Git repositories below it, assigns stable workspace IDs, generates a fabric key, seeds the local authority, and writes a secret invitation:
 
 ```sh
-pando serve \
-  --bind 0.0.0.0:7337 \
-  --data ~/.local/share/pando/authority \
-  --key "$PANDO_KEY"
+pando setup host ~/Code \
+  --authority tcp://DEVBOX_IP:7337 \
+  --invite ~/pando-invite.json
+pando authority ~/Code --bind 0.0.0.0:7337
 ```
 
-Clone the same repository on each trunk. Start a watcher on both, using a stable repository ID and a distinct trunk ID:
+Allow TCP port 7337 through the host firewall. Transfer `pando-invite.json` securely to the other Mac; it is a bearer secret containing the shared fabric key. On the Mac, select the destination folder:
 
 ```sh
-pando watch \
-  --repo ~/Code/project \
-  --repo-id project \
-  --trunk-id macbook \
-  --authority tcp://linuxbox.local:7337 \
-  --key "$PANDO_KEY"
+pando setup join ~/Code --invite ~/pando-invite.json
 ```
 
-The watcher performs a complete classified-tree scan every 60 seconds as a backstop for missed filesystem notifications. Adjust it with `--full-scan-secs`; event-driven snapshots still use the shorter quiescence window.
+Existing disjoint files and subfolders are unioned on first join. If the same path differs, neither side is overwritten: Pando preserves the joining device as a pending version for an explicit decision in the TUI.
 
-For Git repositories, the watcher also runs `git fetch --all --prune` every 30 seconds on a background thread. It updates remote-tracking refs but never checks out, merges, rebases, or pulls. Use `--fetch-secs 0` to disable it or run `pando fetch --repo ~/Code/project` explicitly. Because `.git` is portable state, refreshed remote-tracking refs follow the repository to other trunks. When a remote ref is force-pushed, Pando pins the previous commit under a local `refs/pando/rescue/...` ref so Git garbage collection cannot discard its commit and tree metadata; complete snapshot file content is already retained in Pando's chunk store.
-
-With `--key` or `PANDO_KEY`, the watcher also publishes an authenticated encrypted copy of the latest complete snapshot to a hidden `refs/pando/escape/...` ref on `origin` every 10 minutes. Set `--escape-secs 0` to disable this or use `pando escape export ...` on demand; `--local-only` retains the ref without pushing it. Repeated exports of the same snapshot reuse the existing commit. The separate `pando-restore` executable can fetch that ref and restore into a new destination using only a Git repository, the repository/trunk IDs, and the key—no Pando authority is needed:
-
-```console
-pando-restore --repo . --repo-id my-project --trunk-id macbook \
-  --key ~/.config/pando/fabric.key --fetch-remote origin \
-  --destination ../my-project-recovered
-```
-
-Install the watcher as a launchd agent on macOS or a systemd user service on Linux. The generated service invokes Pando directly without a shell. Omit `--activate` to inspect the installed unit before loading it; `--platform` is normally inferred:
-
-```console
-pando service install --repo ~/Code/project --repo-id project --trunk-id macbook \
-  --authority tcp://linuxbox.local:7337 --key ~/.config/pando/fabric.key \
-  --rehydrate --activate
-```
+Install one background watcher per discovered workspace on both machines:
 
 ```sh
-pando watch \
-  --repo ~/Code/project \
-  --repo-id project \
-  --trunk-id linuxbox \
-  --authority tcp://127.0.0.1:7337 \
-  --key "$PANDO_KEY"
+pando setup services ~/Code --activate
 ```
 
-Inspect the fabric with either surface:
+The daemon watches changes, performs a full classified scan every 60 seconds, fetches Git remotes every 30 seconds, and synchronizes dirty files plus `.git` state without checking out, merging, rebasing, or pulling. Run a one-shot sync or inspect the saved network without supplying repository IDs, authority addresses, or keys:
 
 ```sh
-pando status --repo-id project --authority tcp://linuxbox.local:7337
-pando tui --repo-id project --authority tcp://linuxbox.local:7337
+pando sync ~/Code
+pando status ~/Code
+pando tui ~/Code
 ```
 
-Every TCP RPC now runs inside a Noise `NNpsk0` session using ChaCha20-Poly1305. The shared fabric key authenticates membership and the session encrypts traffic in transit; wrong-key and legacy plaintext clients are rejected. The current self-hosted model assumes the authority machine is trusted, just like the two endpoint Macs: it receives and stores plaintext chunks and manifests. Individual device identities and ciphertext-only authority storage become necessary before a hosted or otherwise untrusted authority.
+When a path changed on both devices, the TUI shows `Needs your decision`. It offers: keep the network version, keep this device, keep both copies, open the selected file in `$VISUAL`/`$EDITOR`, or publish a manual resolution. Every materializing choice asks for confirmation. The daemon remains non-interactive and never blocks waiting for terminal input.
+
+Every TCP RPC runs inside a Noise `NNpsk0` session using ChaCha20-Poly1305. The shared fabric key authenticates membership and encrypts traffic in transit; wrong-key and legacy plaintext clients are rejected. The self-hosted authority is trusted and stores the synchronized data in readable form on that machine, just as the endpoint machines do. Ciphertext-only storage and individual enrollment/revocation are required before a hosted, untrusted Pando authority.
+
+The lower-level `serve`, `watch`, `service`, `push`, `pull`, and `reconcile` commands remain available for diagnostics and custom deployments.
 
 ## Classification
 

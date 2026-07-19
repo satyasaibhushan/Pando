@@ -166,7 +166,7 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
       <h1>Pando<span class="dot">.</span> Technical Spec</h1>
     </div>
     <div class="meta">
-      status: <span style="color:#e2a53c">phase 1 daily-driver baseline in progress</span><br>
+      status: <span style="color:#e2a53c">phase 1 implemented · field validation in progress</span><br>
       drafted: july 2026 · owner: satyasaibhushan<br>
       <a href="index.html">← the vision page</a>
     </div>
@@ -208,11 +208,12 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
   <h2><span class="sn">§02</span>Core concepts</h2>
   <div class="tablewrap"><table>
     <tr><th>Term</th><th>Definition</th></tr>
-    <tr><td class="mono">fabric</td><td>The whole system: daemons + authority + stores. The root system of the grove.</td></tr>
-    <tr><td class="mono">trunk</td><td>A machine enrolled in the fabric. Renders the working universe locally; holds a device key.</td></tr>
+    <tr><td class="mono">network</td><td>One user's connected Pando system: devices, workspaces, authority, and stores.</td></tr>
+    <tr><td class="mono">device</td><td>A machine enrolled in a network. Renders selected workspaces locally and runs their watchers.</td></tr>
+    <tr><td class="mono">workspace</td><td>A discovered Git repository below the one folder selected during setup. It synchronizes independently while retaining its relative path.</td></tr>
     <tr><td class="mono">snapshot</td><td>An immutable, content-addressed capture of a repo's full state at a quiescent moment. Taken every few idle seconds. Forms a DAG (growth rings).</td></tr>
     <tr><td class="mono">overlay</td><td>The portion of a snapshot not derivable from GitHub: <code>snapshot = base commit SHA + overlay</code>. The only thing Pando stores durably.</td></tr>
-    <tr><td class="mono">authority</td><td>The always-on holder of latest state + lease table. Default: Pando cloud. Promotable to a user's own machine (§06).</td></tr>
+    <tr><td class="mono">authority</td><td>The always-on holder of latest state + lease table. Phase 1 uses a trusted user-owned host; Phase 2 adds Pando-hosted authority (§06).</td></tr>
     <tr><td class="mono">lease</td><td>Per-repo write token. One trunk writes at a time; acquisition happens implicitly on sit-down. Prevents conflicts instead of resolving them.</td></tr>
     <tr><td class="mono">fork</td><td>Deliberate divergence: editing while an offline trunk holds unsynced changes. Recorded as two DAG branches; reconciled by three-way merge.</td></tr>
     <tr><td class="mono">recipe</td><td>The generator of derived state: lockfiles + platform triple + tool version. Synced instead of the artifacts it produces.</td></tr>
@@ -252,7 +253,7 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
   <div class="decision">
     <div class="d-head"><span class="id">D4 · CONFLICTS</span><span class="q">Two machines changed the same repo while apart — now what?</span></div>
     <div class="option rejected"><span class="glyph">✕</span><div><b>Last-writer-wins.</b> Silent data loss. Disqualified, full stop.</div></div>
-    <div class="option rejected"><span class="glyph">✕</span><div><b>Conflict copies</b> (<code>main (conflicted copy).ts</code>). Stray files poison builds, imports, tooling.</div></div>
+    <div class="option rejected"><span class="glyph">✕</span><div><b>Automatic conflict copies</b> (<code>main (conflicted copy).ts</code>). Stray files poison builds, imports, tooling. Creating both copies remains an explicit TUI choice.</div></div>
     <div class="option chosen"><span class="glyph">✓</span><div><b>Leases as the normal path:</b> sit-down acquires the per-repo write lease; previous holder released on idle/lid-close. Conflicts are <em>prevented</em>, matching the physics of one human body.</div></div>
     <div class="option chosen"><span class="glyph">✓</span><div><b>Fork-and-merge as the escape hatch:</b> editing past an offline lease-holder knowingly forks the DAG. Auto-merge when non-overlapping (the common case); one explicit reconcile UI otherwise.</div></div>
     <div class="verdict"><b>Verdict</b>Prevention first, merge second, silence never. Agents lease their own branches/worktrees and never contend with the keyboard.</div>
@@ -318,21 +319,21 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
 
 <section id="topology">
   <h2><span class="sn">§06</span>Topology &amp; roles</h2>
-  <p>Three jobs exist; the fabric fills each with whatever the user has, defaulting to cloud. <strong>Roles, not machines.</strong></p>
+  <p>Three jobs exist; the network fills each with whatever the user has. Phase 1 starts with a trusted user-owned authority; Phase 2 makes Pando-hosted authority the zero-setup default while keeping self-hosting. <strong>Roles, not machines.</strong></p>
   <div class="tablewrap"><table>
     <tr><th>Role</th><th>Job</th><th>Default (Tier 0)</th><th>Promotable to</th></tr>
-    <tr><td class="mono">authority</td><td>Always-on latest state + lease table; two machines never need to be awake together</td><td>Pando cloud (ciphertext only)</td><td>User's always-on box; cloud drops to thin relay</td></tr>
+    <tr><td class="mono">authority</td><td>Always-on latest state + lease table; two machines never need to be awake together</td><td>Phase 1: user's trusted always-on host. Phase 2: Pando cloud (ciphertext only)</td><td>User's always-on box; cloud drops to thin relay</td></tr>
     <tr><td class="mono">archive</td><td>Full snapshot history; laptops stay thin</td><td>Pando cloud object storage</td><td>Big-disk home machine</td></tr>
     <tr><td class="mono">builder</td><td>Pre-warm derived state per platform</td><td>Cloud builders + global artifact CAS</td><td>User hardware / repo CI</td></tr>
   </table></div>
-  <p class="dim">Tier 0 = cloud fills everything (the product must be great here — most users own one laptop). Tier 1 = user promotes a machine (<code>pando promote linuxbox --roles=authority,archive,builder</code>). Tier 2 = hybrid, roles filled independently. Pre-warming is always an optimization tier, never a requirement.</p>
+  <p class="dim">Current onboarding is Tailscale-like but invite-file based: host selects one folder and creates a secret invitation; each joining device selects its destination folder. Phase 2 replaces the manual invitation with account enrollment and makes hosted authority Tier 0. Tier 1 promotes a user machine; Tier 2 fills roles independently. Opportunistic P2P may optimize transfers, but the authority remains the durable path.</p>
 </section>
 
 <section id="security">
   <h2><span class="sn">§07</span>Security model</h2>
   <p class="dim"><strong>Implementation status:</strong> Phase 1 wraps every authority RPC in an authenticated Noise <code>NNpsk0</code> session using a shared 32-byte fabric key and ChaCha20-Poly1305. Wrong-key, tampered, and legacy plaintext traffic is rejected. The two-Mac self-hosted topology treats the authority as trusted, so plaintext authority storage is acceptable here. Ciphertext-only storage, individual enrollment, and revocation become release gates before any hosted or otherwise untrusted authority.</p>
   <ul>
-    <li><strong>E2E by default; the authority stores ciphertext.</strong> Not a feature bullet — qualification to exist, and the moat platforms won't cross (they want to read working trees for AI context; Pando cryptographically can't).</li>
+    <li><strong>Hosted mode must be E2E; the authority stores ciphertext.</strong> This is a Phase 2 gate before Pando operates an untrusted authority, not a claim about the current trusted self-hosted implementation.</li>
     <li><strong>Keys:</strong> per-user master key → deterministic per-chunk keys (preserves within-account dedup). Device enrollment via existing-device approval (Tailscale/iMessage pattern). Compress before encrypt.</li>
     <li><strong>Recovery:</strong> recovery phrase + N-device redundancy. Lose everything → overlays are gone, but blast radius is <em>unpushed work only</em>; the pushed base survives in plaintext on GitHub. Recovery UX gets first-class design attention — it's where E2E products die.</li>
     <li><strong>Plaintext-by-design exceptions:</strong> the public artifact CAS (public npm/PyPI bytes; global dedup is the win) and control-plane metadata (machine names, lease timestamps, opaque chunk hashes — never content).</li>
@@ -439,6 +440,9 @@ footer.doc-foot a { color:var(--gold); text-decoration:none; }
       <li><label><input type="checkbox" data-id="p1-8b" checked><span><span class="sub">integrity</span>Safe restore from any retained snapshot into a new atomic destination; hash/path/symlink validation and no overwrite mode</span></label></li>
       <li><label><input type="checkbox" data-id="p1-8"><span><span class="sub">integrity</span>Scheduled audit/restore drill exercised weekly on real repositories</span></label></li>
       <li><label><input type="checkbox" data-id="p1-9a" checked><span><span class="sub">platform</span>Atomic launchd + systemd user-service installer, explicit activation, crash restart, direct no-shell execution, and case-collision refusal before materialization</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-9b" checked><span><span class="sub">onboarding</span>Folder-first host/join setup: recursively discover repositories, persist network/device/workspace configuration, generate a secret invitation, and install all workspace daemons without per-repository input</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-9c" checked><span><span class="sub">onboarding</span>Safe first join: union disjoint files and subfolders; preserve same-path differences as pending forks without overwriting either device</span></label></li>
+      <li><label><input type="checkbox" data-id="p1-9d" checked><span><span class="sub">tui</span>Network/workspace TUI with confirmed keep-network, keep-local, keep-both, editor, and manual-resolution actions; daemon remains non-interactive</span></label></li>
       <li><label><input type="checkbox" data-id="p1-9"><span><span class="sub">platform</span>Exercise sleep/wake and filesystem behavior on sustained real macOS + Linux dogfood runs</span></label></li>
       <li><label><input type="checkbox" data-id="p1-10"><span><span class="sub">dogfood</span>All personal repos on Pando; every anomaly becomes a harness regression test</span></label></li>
       <li><label><input type="checkbox" data-id="p1-11"><span><span class="sub">control</span>After the security and classification baseline lands, run the two-week Pando vs. remote-development control experiment and log every friction moment</span></label></li>
