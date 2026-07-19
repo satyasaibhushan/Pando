@@ -1,7 +1,10 @@
 use crate::authority::{AcquireResult, Authority};
+use crate::classify::{ClassificationPolicy, Classifier};
 use crate::clock::Clock;
 use crate::model::SnapshotId;
-use crate::snapshot::{capture, materialization_delta, materialize_overlay, overlay_against};
+use crate::snapshot::{
+    capture, capture_with_policy, materialization_delta, materialize_overlay, overlay_against,
+};
 use crate::store::ChunkStore;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -141,6 +144,8 @@ impl Trunk {
             if let Some(previous) = &previous
                 && previous.snapshot.files == manifest.files
                 && previous.snapshot.base_commit == manifest.base_commit
+                && previous.snapshot.classification_version == manifest.classification_version
+                && previous.snapshot.ignore_patterns == manifest.ignore_patterns
             {
                 return Ok(PushResult::NoChanges {
                     snapshot: previous.snapshot.id.clone(),
@@ -186,16 +191,38 @@ impl Trunk {
             });
         }
         let overlay = authority.overlay(&authority_head)?;
-        let current = capture(
+        let previous = state
+            .head
+            .as_deref()
+            .map(|head| authority.overlay(head))
+            .transpose()?;
+        let current_policy = previous
+            .as_ref()
+            .map(|overlay| {
+                (
+                    overlay.snapshot.classification_version,
+                    overlay.snapshot.ignore_patterns.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    overlay.snapshot.classification_version,
+                    overlay.snapshot.ignore_patterns.clone(),
+                )
+            });
+        let current = capture_with_policy(
             &self.repo,
             &self.repo_id,
             &self.trunk_id,
             state.head.clone(),
             clock.now_ms(),
             &self.chunks,
+            ClassificationPolicy {
+                version: current_policy.0,
+                patterns: current_policy.1,
+            },
         )?;
-        if let Some(local_head) = &state.head {
-            let previous = authority.overlay(local_head)?;
+        if let Some(previous) = previous {
             if current.files != previous.snapshot.files {
                 return Ok(PullResult::Diverged {
                     local_head: state.head,
@@ -218,7 +245,7 @@ impl Trunk {
             }
         }
 
-        let delta = materialization_delta(&overlay, &current.files);
+        let delta = materialization_delta(&self.repo, &overlay, &current.files)?;
         let mut downloaded = 0;
         for entry in delta.upserts.values() {
             if !self.chunks.contains(&entry.chunk) {
@@ -288,15 +315,21 @@ impl Trunk {
             .filter(|(path, _)| !path.starts_with(".git/"))
             .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect();
-        let baseline = match &overlay.snapshot.base_commit {
+        let classifier = Classifier::from_policy(
+            &self.repo,
+            overlay.snapshot.classification_version,
+            overlay.snapshot.ignore_patterns.clone(),
+        )?;
+        let mut baseline = match &overlay.snapshot.base_commit {
             Some(commit) => crate::git::baseline(&self.repo, commit, &self.chunks)?,
             None => BTreeMap::new(),
         };
+        baseline.retain(|path, _| classifier.is_portable(Path::new(path), false));
         Ok(current_files == baseline)
     }
 }
 
-fn default_data_root() -> Result<PathBuf> {
+pub(crate) fn default_data_root() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("PANDO_DATA_HOME") {
         return Ok(PathBuf::from(path));
     }

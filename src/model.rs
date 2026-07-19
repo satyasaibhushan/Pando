@@ -31,6 +31,10 @@ pub struct Manifest {
     pub created_at_ms: u64,
     pub parent: Option<SnapshotId>,
     pub base_commit: Option<String>,
+    #[serde(default)]
+    pub classification_version: u32,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
     pub files: BTreeMap<String, FileEntry>,
 }
 

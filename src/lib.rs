@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod classify;
 pub mod clock;
 pub mod daemon;
 pub mod git;
