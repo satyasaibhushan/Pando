@@ -106,6 +106,10 @@ impl TransportKey {
         }
         encoded
     }
+
+    pub(crate) fn encoded(&self) -> String {
+        self.hex()
+    }
 }
 
 impl Drop for TransportKey {
