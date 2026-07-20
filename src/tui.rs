@@ -228,8 +228,7 @@ fn run_loop(
                         pending = None;
                         continue;
                     };
-                    let trunk =
-                        Trunk::open(entry.path.clone(), &workspace.id, &config.device_id)?;
+                    let trunk = Trunk::open(entry.path.clone(), &workspace.id, &config.device_id)?;
                     let result = match action {
                         PendingAction::Authority => {
                             trunk.reconcile(authority, &clock, fork, ReconcileChoice::Authority)
@@ -261,8 +260,7 @@ fn run_loop(
                 notice.clear();
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                selected_workspace =
-                    (selected_workspace + 1).min(entries.len().saturating_sub(1));
+                selected_workspace = (selected_workspace + 1).min(entries.len().saturating_sub(1));
                 selected_conflict = 0;
                 notice.clear();
             }

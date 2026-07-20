@@ -2,8 +2,9 @@ use crate::model::{FileEntry, FileKind};
 use crate::store::ChunkStore;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteRefChange {
@@ -159,6 +160,109 @@ pub fn pushed_base(repo: &Path) -> Result<Option<String>> {
     Ok(nearest.map(|(_, sha)| sha))
 }
 
+/// Bundle every object that is not already reachable from a remote-tracking
+/// ref into a single pack, returned as manifest entries at their natural
+/// `.git/objects/pack/` paths. Covers all local refs, stashes, reflog entries,
+/// and the index; a repository with no remotes packs its full history.
+pub fn local_pack_entries(repo: &Path, store: &ChunkStore) -> Result<BTreeMap<String, FileEntry>> {
+    let staging = std::env::temp_dir().join(format!(
+        "pando-pack-{}-{}",
+        std::process::id(),
+        &blake3::hash(repo.to_string_lossy().as_bytes())
+            .to_hex()
+            .to_string()[..12]
+    ));
+    std::fs::create_dir_all(&staging)?;
+    let result = pack_local_objects(repo, &staging, store);
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn pack_local_objects(
+    repo: &Path,
+    staging: &Path,
+    store: &ChunkStore,
+) -> Result<BTreeMap<String, FileEntry>> {
+    let objects = git(
+        repo,
+        &[
+            "rev-list",
+            "--objects",
+            "--all",
+            "--reflog",
+            "--indexed-objects",
+            "--not",
+            "--remotes",
+        ],
+    )?;
+    if objects.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(BTreeMap::new());
+    }
+    // Single-threaded packing keeps the pack bytes reproducible, so an
+    // unchanged repository keeps producing the identical manifest.
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "pack.threads=1", "pack-objects", "--quiet"])
+        .arg(staging.join("pack"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run git pack-objects")?;
+    child
+        .stdin
+        .take()
+        .context("open git pack-objects stdin")?
+        .write_all(&objects)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "git pack-objects failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut entries = BTreeMap::new();
+    for item in std::fs::read_dir(staging)? {
+        let item = item?;
+        let name = item
+            .file_name()
+            .into_string()
+            .ok()
+            .context("unexpected pack file name")?;
+        let bytes = std::fs::read(item.path())?;
+        let chunk = store.put(&bytes)?;
+        entries.insert(
+            format!(".git/objects/pack/{name}"),
+            FileEntry {
+                chunk,
+                size: bytes.len() as u64,
+                kind: FileKind::Regular,
+                executable: false,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+/// Make `commit` available locally, fetching from the repository's remotes
+/// when it is missing. History that a snapshot did not carry must be
+/// reachable this way; anything else is a hard error, never silent loss.
+pub fn ensure_commit(repo: &Path, commit: &str) -> Result<()> {
+    if commit_present(repo, commit) {
+        return Ok(());
+    }
+    fetch_remotes(repo).with_context(|| format!("fetch history for missing commit {commit}"))?;
+    if commit_present(repo, commit) {
+        return Ok(());
+    }
+    bail!("commit {commit} is not available locally or from any git remote");
+}
+
+fn commit_present(repo: &Path, commit: &str) -> bool {
+    git(repo, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok()
+}
+
 pub fn baseline(
     repo: &Path,
     commit: &str,
@@ -167,6 +271,7 @@ pub fn baseline(
     if !is_repository_root(repo) {
         bail!("{} is not a Git repository root", repo.display());
     }
+    ensure_commit(repo, commit)?;
     let output = git(repo, &["ls-tree", "-rz", "--full-tree", commit])?;
     let mut files = BTreeMap::new();
     for record in output
@@ -204,7 +309,7 @@ pub fn baseline(
     Ok(files)
 }
 
-fn is_repository_root(repo: &Path) -> bool {
+pub(crate) fn is_repository_root(repo: &Path) -> bool {
     let Ok(top_level) = git(repo, &["rev-parse", "--show-toplevel"]) else {
         return false;
     };

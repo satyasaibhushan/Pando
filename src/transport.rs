@@ -400,9 +400,12 @@ impl RemoteAuthority {
 
     fn connect(&self) -> Result<Session> {
         let mut stream = open_stream(&self.address)?;
-        write_handshake_frame(&mut stream, &encode_hello(&Hello::Device {
-            device_id: self.device_id.clone(),
-        })?)?;
+        write_handshake_frame(
+            &mut stream,
+            &encode_hello(&Hello::Device {
+                device_id: self.device_id.clone(),
+            })?,
+        )?;
         let transport =
             initiator_handshake(&mut stream, &self.key).context("secure authority handshake")?;
         Ok(Session { stream, transport })
@@ -455,14 +458,21 @@ fn exchange(session: &mut Session, request: &Request) -> Result<Response> {
 pub fn enroll(address: &str, code: &str, device_name: &str) -> Result<EnrollmentGrant> {
     let psk = TransportKey::from_bytes(crate::registry::enrollment_psk(code));
     let mut stream = open_stream(address)?;
-    write_handshake_frame(&mut stream, &encode_hello(&Hello::Enroll {
-        code_id: crate::registry::code_id(code),
-    })?)?;
+    write_handshake_frame(
+        &mut stream,
+        &encode_hello(&Hello::Enroll {
+            code_id: crate::registry::code_id(code),
+        })?,
+    )?;
     let mut session = initiator_handshake(&mut stream, &psk)
         .context("enrollment refused; check the code and address")?;
-    write_secure_message(&mut stream, &mut session, &Request::Enroll {
-        device_name: device_name.to_owned(),
-    })?;
+    write_secure_message(
+        &mut stream,
+        &mut session,
+        &Request::Enroll {
+            device_name: device_name.to_owned(),
+        },
+    )?;
     match read_secure_message(&mut stream, &mut session)? {
         Response::Enrolled(grant) => Ok(grant),
         Response::Error(message) => bail!(message),
@@ -754,8 +764,8 @@ fn handle_connection(
                     return Ok(());
                 }
                 let now_ms = SystemClock.now_ms();
-                let response = handle_parts(request, &mut parts, authority)
-                    .unwrap_or_else(|request| {
+                let response =
+                    handle_parts(request, &mut parts, authority).unwrap_or_else(|request| {
                         dispatch(request, &device_id, authority, registry, now_ms)
                     });
                 write_secure_message(&mut stream, &mut session, &response)?;

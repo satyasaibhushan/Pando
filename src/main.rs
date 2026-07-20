@@ -189,7 +189,9 @@ fn main() -> Result<()> {
                 println!("This device is not on a Pando network yet.");
                 println!();
                 println!("  pando up                          start a new network here");
-                println!("  pando up --to <addr> --code <c>   join one (get both from `pando invite` on another device)");
+                println!(
+                    "  pando up --to <addr> --code <c>   join one (get both from `pando invite` on another device)"
+                );
                 Ok(())
             }
         };
@@ -577,8 +579,7 @@ fn up(
         (Some(to), Some(code)) => {
             let grant = pando::transport::enroll(&to, &code, &device_name)?;
             TransportKey::from_hex(&grant.device_key)?.store(pando::config::device_key_path()?)?;
-            TransportKey::from_hex(&grant.network_key)?
-                .store(pando::config::network_key_path()?)?;
+            TransportKey::from_hex(&grant.network_key)?.store(pando::config::network_key_path()?)?;
             let config =
                 DeviceConfig::new(grant.network_id, grant.device_id, device_name.clone(), to);
             pando::config::save(&config)?;
@@ -592,7 +593,10 @@ fn up(
         }
         (None, None) => {
             let now = SystemClock.now_ms();
-            let port = bind.rsplit_once(':').map(|(_, port)| port).unwrap_or("7337");
+            let port = bind
+                .rsplit_once(':')
+                .map(|(_, port)| port)
+                .unwrap_or("7337");
             let advertised = format!("{}:{port}", detect_ip());
             let network_key = TransportKey::random()?;
             let device_key = TransportKey::random()?;
@@ -719,7 +723,12 @@ fn push_shares(
             let trunk = Trunk::open(&path, &workspace.id, &config.device_id)?;
             let result = trunk.push(authority, &SystemClock)?;
             trunk.release(authority)?;
-            println!("{}/{}: {}", share.name, workspace.name, describe_push(&result));
+            println!(
+                "{}/{}: {}",
+                share.name,
+                workspace.name,
+                describe_push(&result)
+            );
         }
     }
     Ok(())
@@ -735,7 +744,9 @@ fn ensure_services(config: &DeviceConfig, no_services: bool) -> Result<()> {
     let platform = match pando::service::ServicePlatform::native() {
         Ok(platform) => platform,
         Err(error) => {
-            eprintln!("services not installed: {error}; run `pando serve` and `pando watch` manually");
+            eprintln!(
+                "services not installed: {error}; run `pando serve` and `pando watch` manually"
+            );
             return Ok(());
         }
     };

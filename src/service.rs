@@ -36,7 +36,10 @@ impl ServiceKind {
         match self {
             Self::Authority => "io.pando.authority".into(),
             Self::Watch { workspace_id } => {
-                format!("io.pando.watch.{}", &workspace_id[..workspace_id.len().min(12)])
+                format!(
+                    "io.pando.watch.{}",
+                    &workspace_id[..workspace_id.len().min(12)]
+                )
             }
         }
     }
@@ -80,14 +83,22 @@ pub fn install(
                 .map(Path::to_owned)
                 .unwrap_or(default_launchd_directory()?);
             let filename = format!("{service_name}.plist");
-            (directory, filename, render_launchd(kind, binary, &service_name))
+            (
+                directory,
+                filename,
+                render_launchd(kind, binary, &service_name),
+            )
         }
         ServicePlatform::Systemd => {
             let directory = output_directory
                 .map(Path::to_owned)
                 .unwrap_or(default_systemd_directory()?);
             let filename = format!("{service_name}.service");
-            (directory, filename, render_systemd(kind, binary, &service_name))
+            (
+                directory,
+                filename,
+                render_systemd(kind, binary, &service_name),
+            )
         }
     };
     fs::create_dir_all(&directory)

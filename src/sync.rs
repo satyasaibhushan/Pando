@@ -178,7 +178,10 @@ impl Trunk {
                     },
                 )?;
                 let empty = BTreeMap::new();
-                let base_files = base.as_ref().map(|base| &base.snapshot.files).unwrap_or(&empty);
+                let base_files = base
+                    .as_ref()
+                    .map(|base| &base.snapshot.files)
+                    .unwrap_or(&empty);
                 let (merged, conflicts) =
                     three_way_files(base_files, &local.files, &remote.snapshot.files);
                 if !conflicts.is_empty() {
@@ -198,6 +201,7 @@ impl Trunk {
                 let delta = materialization_delta(&self.repo, &target, &local.files)?;
                 self.ensure_materialization_chunks(authority, &target, &delta)?;
                 materialize_overlay(&self.repo, &delta, &self.chunks)?;
+                self.ensure_git_history(&target)?;
                 state.head = Some(authority_head);
                 self.save_state(&state)?;
             }
@@ -320,6 +324,7 @@ impl Trunk {
         let delta = materialization_delta(&self.repo, &overlay, &current.files)?;
         let downloaded = self.ensure_materialization_chunks(authority, &overlay, &delta)?;
         materialize_overlay(&self.repo, &delta, &self.chunks)?;
+        self.ensure_git_history(&overlay)?;
         state.head = Some(authority_head.clone());
         self.save_state(&state)?;
         Ok(PullResult::Applied {
@@ -603,7 +608,20 @@ impl Trunk {
     ) -> Result<()> {
         let delta = materialization_delta(&self.repo, target, current)?;
         self.ensure_materialization_chunks(authority, target, &delta)?;
-        materialize_overlay(&self.repo, &delta, &self.chunks)
+        materialize_overlay(&self.repo, &delta, &self.chunks)?;
+        self.ensure_git_history(target)
+    }
+
+    /// Snapshots ship git history as a thin local-only pack; after
+    /// materializing one, the remote-reachable objects must be fetched into
+    /// the repository so its refs resolve.
+    fn ensure_git_history(&self, target: &crate::model::Overlay) -> Result<()> {
+        if let Some(commit) = target.snapshot.base_commit.as_deref()
+            && crate::git::is_repository_root(&self.repo)
+        {
+            crate::git::ensure_commit(&self.repo, commit)?;
+        }
+        Ok(())
     }
 
     fn ensure_materialization_chunks<A: Authority + ?Sized>(

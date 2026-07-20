@@ -65,6 +65,10 @@ fn capture_with_classifier(
     store: &ChunkStore,
     classifier: Classifier,
 ) -> Result<Manifest> {
+    // Git repositories travel with a thin object pack instead of the whole
+    // object database: receivers refetch remote-reachable history from the
+    // repository's own remotes.
+    let git_root = git::is_repository_root(canonical_repo);
     let mut files = BTreeMap::new();
     for item in WalkDir::new(canonical_repo)
         .follow_links(false)
@@ -75,7 +79,8 @@ fn capture_with_classifier(
                     .path()
                     .strip_prefix(canonical_repo)
                     .is_ok_and(|relative| {
-                        classifier.is_portable(relative, item.file_type().is_dir())
+                        !(git_root && relative.starts_with(".git/objects"))
+                            && classifier.is_portable(relative, item.file_type().is_dir())
                     })
         })
     {
@@ -110,6 +115,10 @@ fn capture_with_classifier(
                 executable,
             },
         );
+    }
+
+    if git_root {
+        files.extend(git::local_pack_entries(canonical_repo, store)?);
     }
 
     let base_commit = git::pushed_base(canonical_repo).unwrap_or(None);

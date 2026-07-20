@@ -1005,7 +1005,14 @@ fn cli_onboarding_flows_from_up_to_a_joined_folder() {
     // First device creates the network, then runs the authority.
     pando(
         &host_home,
-        &["up", "--no-services", "--name", "macbook", "--bind", &address],
+        &[
+            "up",
+            "--no-services",
+            "--name",
+            "macbook",
+            "--bind",
+            &address,
+        ],
     );
     let _serve = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_pando"))
@@ -1639,6 +1646,100 @@ fn git_branch_stash_index_and_dirty_files_follow_the_user() {
         "feature"
     );
     assert!(git_output(&linuxbox, &["stash", "list"]).contains("portable stash"));
+}
+
+#[test]
+fn git_history_travels_as_a_thin_pack_and_refetches_from_the_remote() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("remote.git");
+    let macbook = root.path().join("macbook");
+    let linuxbox = root.path().join("linuxbox");
+    git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(
+        root.path(),
+        &["init", "-b", "main", macbook.to_str().unwrap()],
+    );
+    git(&macbook, &["config", "user.email", "pando@example.test"]);
+    git(&macbook, &["config", "user.name", "Pando Test"]);
+    fs::write(macbook.join("pushed.txt"), "pushed\n").unwrap();
+    git(&macbook, &["add", "pushed.txt"]);
+    git(&macbook, &["commit", "-m", "pushed history"]);
+    git(
+        &macbook,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&macbook, &["push", "-u", "origin", "main"]);
+    fs::write(macbook.join("local.txt"), "local only\n").unwrap();
+    git(&macbook, &["add", "local.txt"]);
+    git(&macbook, &["commit", "-m", "local only commit"]);
+    let local_commit = git_output(&macbook, &["rev-parse", "HEAD"]);
+
+    let mut authority = FileAuthority::open(root.path().join("authority")).unwrap();
+    let clock = VirtualClock::at(42_000);
+    let first = Trunk::open_with_state(
+        &macbook,
+        "git-repo",
+        "macbook",
+        root.path().join("trunks/macbook"),
+    )
+    .unwrap();
+    first.push(&mut authority, &clock).unwrap();
+    clock.advance(1_000);
+    let repeat = first.push(&mut authority, &clock).unwrap();
+    assert!(
+        matches!(repeat, PushResult::NoChanges { .. }),
+        "an unchanged repository must repack deterministically: {repeat:?}"
+    );
+    first.release(&mut authority).unwrap();
+
+    let head = authority.head("git-repo").unwrap().unwrap();
+    let overlay = authority.overlay(&head).unwrap();
+    let object_paths: Vec<_> = overlay
+        .snapshot
+        .files
+        .keys()
+        .filter(|path| path.starts_with(".git/objects/"))
+        .collect();
+    assert!(!object_paths.is_empty());
+    assert!(
+        object_paths
+            .iter()
+            .all(|path| path.starts_with(".git/objects/pack/pack-")),
+        "snapshot carries the object database instead of a thin pack: {object_paths:?}"
+    );
+
+    fs::create_dir_all(&linuxbox).unwrap();
+    let second = Trunk::open_with_state(
+        &linuxbox,
+        "git-repo",
+        "linuxbox",
+        root.path().join("trunks/linuxbox"),
+    )
+    .unwrap();
+    second.pull(&authority, &clock).unwrap();
+    assert_eq!(git_output(&linuxbox, &["rev-parse", "HEAD"]), local_commit);
+    assert!(git_output(&linuxbox, &["log", "--format=%s"]).contains("pushed history"));
+    assert_eq!(
+        fs::read_to_string(linuxbox.join("pushed.txt")).unwrap(),
+        "pushed\n"
+    );
+
+    fs::remove_dir_all(&remote).unwrap();
+    let edgebox = root.path().join("edgebox");
+    fs::create_dir_all(&edgebox).unwrap();
+    let third = Trunk::open_with_state(
+        &edgebox,
+        "git-repo",
+        "edgebox",
+        root.path().join("trunks/edgebox"),
+    )
+    .unwrap();
+    let error = format!("{:#}", third.pull(&authority, &clock).unwrap_err());
+    assert!(
+        error.contains("fetch history for missing commit"),
+        "expected a loud fetch failure, got: {error}"
+    );
 }
 
 #[test]

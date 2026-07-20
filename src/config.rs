@@ -57,7 +57,11 @@ impl DeviceConfig {
     }
 
     pub fn upsert_share(&mut self, share: ShareConfig) {
-        match self.shares.iter_mut().find(|entry| entry.name == share.name) {
+        match self
+            .shares
+            .iter_mut()
+            .find(|entry| entry.name == share.name)
+        {
             Some(entry) => *entry = share,
             None => self.shares.push(share),
         }
@@ -321,7 +325,13 @@ mod tests {
             path: share_path.clone(),
             workspaces: vec![
                 workspace(&config.network_id, "personal", &share_path, ".".into()).unwrap(),
-                workspace(&config.network_id, "personal", &share_path, "apps/one".into()).unwrap(),
+                workspace(
+                    &config.network_id,
+                    "personal",
+                    &share_path,
+                    "apps/one".into(),
+                )
+                .unwrap(),
             ],
         });
 
