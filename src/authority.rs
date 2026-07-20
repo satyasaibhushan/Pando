@@ -48,6 +48,10 @@ pub struct GarbageCollectionReport {
     pub applied: bool,
 }
 
+/// Largest payload moved in one round trip: one batch of small chunks, or one
+/// part of a chunk too large to send whole.
+pub const TRANSFER_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
 pub trait Authority {
     fn acquire(
         &mut self,
@@ -60,6 +64,33 @@ pub trait Authority {
     fn put_chunk(&mut self, hash: &str, bytes: &[u8]) -> Result<()>;
     fn has_chunk(&self, hash: &str) -> Result<bool>;
     fn get_chunk(&self, hash: &str) -> Result<Vec<u8>>;
+    /// Which of `hashes` the authority does not have yet.
+    fn missing_chunks(&self, hashes: &[String]) -> Result<Vec<String>> {
+        let mut missing = Vec::new();
+        for hash in hashes {
+            if !self.has_chunk(hash)? {
+                missing.push(hash.clone());
+            }
+        }
+        Ok(missing)
+    }
+    fn put_chunks(&mut self, chunks: Vec<(String, Vec<u8>)>) -> Result<()> {
+        for (hash, bytes) in chunks {
+            self.put_chunk(&hash, &bytes)?;
+        }
+        Ok(())
+    }
+    /// Fetch `hashes` in order, feeding each chunk to `sink` as it arrives.
+    fn get_chunks(
+        &self,
+        hashes: &[String],
+        sink: &mut dyn FnMut(&str, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        for hash in hashes {
+            sink(hash, self.get_chunk(hash)?)?;
+        }
+        Ok(())
+    }
     fn publish(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()>;
     fn publish_fork(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()>;
     fn forks(&self, repo_id: &str) -> Result<Vec<SnapshotId>>;

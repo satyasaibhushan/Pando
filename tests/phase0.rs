@@ -1477,6 +1477,40 @@ fn tcp_authority_transports_a_snapshot() {
 }
 
 #[test]
+fn tcp_authority_moves_an_over_budget_chunk_in_parts() {
+    let harness = Harness::plain();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let authority = harness.authority();
+    let key = TransportKey::from_bytes([7; 32]);
+    let registry = tcp_registry(harness._root.path(), &key);
+    std::thread::spawn(move || {
+        pando::transport::serve_listener(listener, authority, registry).unwrap()
+    });
+    let mut remote = RemoteAuthority::new(address.to_string(), TCP_DEVICE_ID, key);
+
+    // One chunk over the transfer budget (moved in parts) plus small ones
+    // (moved in a batch).
+    let big: Vec<u8> = (0..pando::authority::TRANSFER_BUDGET_BYTES + 4096)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(harness.first_path.join("big.bin"), &big).unwrap();
+    fs::write(harness.first_path.join("small.txt"), "batched\n").unwrap();
+
+    let first = harness.first();
+    let second = harness.second();
+    first.push(&mut remote, &harness.clock).unwrap();
+    first.release(&mut remote).unwrap();
+    second.pull(&remote, &harness.clock).unwrap();
+
+    assert_eq!(fs::read(harness.second_path.join("big.bin")).unwrap(), big);
+    assert_eq!(
+        fs::read_to_string(harness.second_path.join("small.txt")).unwrap(),
+        "batched\n"
+    );
+}
+
+#[test]
 fn tcp_authority_rejects_a_client_with_the_wrong_key() {
     let harness = Harness::plain();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -1,4 +1,4 @@
-use crate::authority::{AcquireResult, Authority};
+use crate::authority::{AcquireResult, Authority, TRANSFER_BUDGET_BYTES};
 use crate::classify::{ClassificationPolicy, Classifier};
 use crate::clock::Clock;
 use crate::model::SnapshotId;
@@ -183,11 +183,7 @@ impl Trunk {
                     three_way_files(base_files, &local.files, &remote.snapshot.files);
                 if !conflicts.is_empty() {
                     let fork_overlay = overlay_against(&self.repo, local, &self.chunks)?;
-                    for entry in fork_overlay.upserts.values() {
-                        if !authority.has_chunk(&entry.chunk)? {
-                            authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
-                        }
-                    }
+                    self.upload_missing_chunks(authority, &fork_overlay)?;
                     let fork = fork_overlay.snapshot.id.clone();
                     authority.publish_fork(&fork_overlay, &self.trunk_id, now_ms)?;
                     return Ok(PushResult::Conflicted {
@@ -229,13 +225,7 @@ impl Trunk {
                 });
             }
             let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
-            let mut uploaded = 0;
-            for entry in overlay.upserts.values() {
-                if !authority.has_chunk(&entry.chunk)? {
-                    authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
-                    uploaded += 1;
-                }
-            }
+            let uploaded = self.upload_missing_chunks(authority, &overlay)?;
             authority.publish(&overlay, &self.trunk_id, now_ms)?;
             let snapshot = overlay.snapshot.id.clone();
             let exposure_bytes = overlay.bytes();
@@ -629,25 +619,75 @@ impl Trunk {
             .any(|entry| !self.chunks.contains(&entry.chunk))
             && target.snapshot.base_commit.is_some()
         {
-            for (path, entry) in &target.upserts {
-                if (path == ".git" || path.starts_with(".git/"))
-                    && !self.chunks.contains(&entry.chunk)
-                {
-                    let bytes = authority.get_chunk(&entry.chunk)?;
-                    self.chunks.put_verified(&entry.chunk, &bytes)?;
-                    downloaded += 1;
-                }
-            }
+            let baseline: Vec<String> = target
+                .upserts
+                .iter()
+                .filter(|(path, entry)| {
+                    (*path == ".git" || path.starts_with(".git/"))
+                        && !self.chunks.contains(&entry.chunk)
+                })
+                .map(|(_, entry)| entry.chunk.clone())
+                .collect();
+            downloaded += self.download_chunks(authority, baseline)?;
             self.reconstruct_git_baseline(target)?;
         }
-        for entry in delta.upserts.values() {
-            if !self.chunks.contains(&entry.chunk) {
-                let bytes = authority.get_chunk(&entry.chunk)?;
-                self.chunks.put_verified(&entry.chunk, &bytes)?;
-                downloaded += 1;
-            }
-        }
+        let missing: Vec<String> = delta
+            .upserts
+            .values()
+            .filter(|entry| !self.chunks.contains(&entry.chunk))
+            .map(|entry| entry.chunk.clone())
+            .collect();
+        downloaded += self.download_chunks(authority, missing)?;
         Ok(downloaded)
+    }
+
+    fn download_chunks<A: Authority + ?Sized>(
+        &self,
+        authority: &A,
+        mut hashes: Vec<String>,
+    ) -> Result<usize> {
+        hashes.sort();
+        hashes.dedup();
+        let mut downloaded = 0;
+        authority.get_chunks(&hashes, &mut |hash, bytes| {
+            self.chunks.put_verified(hash, &bytes)?;
+            downloaded += 1;
+            Ok(())
+        })?;
+        Ok(downloaded)
+    }
+
+    /// Upload the overlay's chunks the authority doesn't already have, in
+    /// batched round trips. Returns how many chunks were sent.
+    fn upload_missing_chunks<A: Authority + ?Sized>(
+        &self,
+        authority: &mut A,
+        overlay: &crate::model::Overlay,
+    ) -> Result<usize> {
+        let mut hashes: Vec<String> = overlay
+            .upserts
+            .values()
+            .map(|entry| entry.chunk.clone())
+            .collect();
+        hashes.sort();
+        hashes.dedup();
+        let missing = authority.missing_chunks(&hashes)?;
+        let uploaded = missing.len();
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0;
+        for hash in missing {
+            let bytes = self.chunks.get(&hash)?;
+            if batch_bytes + bytes.len() > TRANSFER_BUDGET_BYTES && !batch.is_empty() {
+                authority.put_chunks(std::mem::take(&mut batch))?;
+                batch_bytes = 0;
+            }
+            batch_bytes += bytes.len();
+            batch.push((hash, bytes));
+        }
+        if !batch.is_empty() {
+            authority.put_chunks(batch)?;
+        }
+        Ok(uploaded)
     }
 
     fn reconstruct_git_baseline(&self, target: &crate::model::Overlay) -> Result<()> {

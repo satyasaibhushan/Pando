@@ -1,4 +1,6 @@
-use crate::authority::{AcquireResult, Authority, AuthorityStatus, FileAuthority};
+use crate::authority::{
+    AcquireResult, Authority, AuthorityStatus, FileAuthority, TRANSFER_BUDGET_BYTES,
+};
 use crate::clock::{Clock, SystemClock};
 use crate::model::{Overlay, SnapshotId};
 use crate::registry::{DeviceInfo, EnrollmentGrant, Registry, ShareRecord};
@@ -157,6 +159,12 @@ pub struct RemoteAuthority {
     address: String,
     device_id: String,
     key: TransportKey,
+    session: Arc<Mutex<Option<Session>>>,
+}
+
+struct Session {
+    stream: TcpStream,
+    transport: snow::TransportState,
 }
 
 impl fmt::Debug for RemoteAuthority {
@@ -213,6 +221,27 @@ enum Request {
     GetChunk {
         hash: String,
     },
+    MissingChunks {
+        hashes: Vec<String>,
+    },
+    PutChunks {
+        chunks: Vec<(String, Vec<u8>)>,
+    },
+    GetChunks {
+        hashes: Vec<String>,
+        budget: u64,
+    },
+    PutChunkPart {
+        hash: String,
+        offset: u64,
+        total: u64,
+        bytes: Vec<u8>,
+    },
+    GetChunkPart {
+        hash: String,
+        offset: u64,
+        budget: u64,
+    },
     Publish {
         overlay: Overlay,
         trunk_id: String,
@@ -256,6 +285,16 @@ enum Response {
     Acquire(AcquireResult),
     Bool(bool),
     Bytes(Vec<u8>),
+    Hashes(Vec<String>),
+    Chunks(Vec<(String, Vec<u8>)>),
+    Oversized {
+        hash: String,
+        total: u64,
+    },
+    BytesPart {
+        total: u64,
+        bytes: Vec<u8>,
+    },
     Head(Option<SnapshotId>),
     Overlay(Overlay),
     Forks(Vec<SnapshotId>),
@@ -281,6 +320,7 @@ impl RemoteAuthority {
             address: address.into(),
             device_id: device_id.into(),
             key,
+            session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -323,20 +363,91 @@ impl RemoteAuthority {
         }
     }
 
+    /// One request/response over the persistent session. A dead session
+    /// (server idle timeout, network blip) is replaced and the request is
+    /// retried once; logical errors keep the session alive.
     fn rpc(&self, request: Request) -> Result<Response> {
-        let mut stream = open_stream(&self.address)?;
-        write_handshake_frame(&mut stream, &encode_hello(&Hello::Device {
-            device_id: self.device_id.clone(),
-        })?)?;
-        let mut session =
-            initiator_handshake(&mut stream, &self.key).context("secure authority handshake")?;
-        write_secure_message(&mut stream, &mut session, &request)?;
-        let response: Response = read_secure_message(&mut stream, &mut session)?;
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("authority session lock poisoned"))?;
+        let reused = guard.is_some();
+        if guard.is_none() {
+            *guard = Some(self.connect()?);
+        }
+        let response = match exchange(guard.as_mut().expect("session"), &request) {
+            Ok(response) => response,
+            Err(error) => {
+                *guard = None;
+                if !reused {
+                    return Err(error);
+                }
+                *guard = Some(self.connect()?);
+                match exchange(guard.as_mut().expect("session"), &request) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        *guard = None;
+                        return Err(error);
+                    }
+                }
+            }
+        };
         match response {
             Response::Error(message) => bail!(message),
             other => Ok(other),
         }
     }
+
+    fn connect(&self) -> Result<Session> {
+        let mut stream = open_stream(&self.address)?;
+        write_handshake_frame(&mut stream, &encode_hello(&Hello::Device {
+            device_id: self.device_id.clone(),
+        })?)?;
+        let transport =
+            initiator_handshake(&mut stream, &self.key).context("secure authority handshake")?;
+        Ok(Session { stream, transport })
+    }
+
+    fn put_chunk_in_parts(&self, hash: &str, bytes: &[u8]) -> Result<()> {
+        let total = bytes.len() as u64;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + TRANSFER_BUDGET_BYTES).min(bytes.len());
+            self.rpc(Request::PutChunkPart {
+                hash: hash.to_owned(),
+                offset: offset as u64,
+                total,
+                bytes: bytes[offset..end].to_vec(),
+            })?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    fn get_chunk_in_parts(&self, hash: &str, total: u64) -> Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(usize::try_from(total).context("chunk too large")?);
+        while (buffer.len() as u64) < total {
+            match self.rpc(Request::GetChunkPart {
+                hash: hash.to_owned(),
+                offset: buffer.len() as u64,
+                budget: TRANSFER_BUDGET_BYTES as u64,
+            })? {
+                Response::BytesPart { total: t, bytes } => {
+                    if t != total || bytes.is_empty() {
+                        bail!("authority returned an inconsistent chunk part for {hash}");
+                    }
+                    buffer.extend_from_slice(&bytes);
+                }
+                _ => bail!("unexpected chunk-part response"),
+            }
+        }
+        Ok(buffer)
+    }
+}
+
+fn exchange(session: &mut Session, request: &Request) -> Result<Response> {
+    write_secure_message(&mut session.stream, &mut session.transport, request)?;
+    read_secure_message(&mut session.stream, &mut session.transport)
 }
 
 /// Join a network: authenticate with a one-time enrollment code and receive
@@ -365,8 +476,8 @@ fn open_stream(address: &str) -> Result<TcpStream> {
         .with_context(|| format!("resolve authority {address}"))?;
     let stream = connect_any(addresses, std::time::Duration::from_secs(5))
         .with_context(|| format!("connect to authority {address}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
     Ok(stream)
 }
 
@@ -420,6 +531,9 @@ impl Authority for RemoteAuthority {
     }
 
     fn put_chunk(&mut self, hash: &str, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > TRANSFER_BUDGET_BYTES {
+            return self.put_chunk_in_parts(hash, bytes);
+        }
         expect_ok(self.rpc(Request::PutChunk {
             hash: hash.into(),
             bytes: bytes.to_vec(),
@@ -436,8 +550,84 @@ impl Authority for RemoteAuthority {
     fn get_chunk(&self, hash: &str) -> Result<Vec<u8>> {
         match self.rpc(Request::GetChunk { hash: hash.into() })? {
             Response::Bytes(bytes) => Ok(bytes),
+            Response::Oversized { hash, total } => self.get_chunk_in_parts(&hash, total),
             _ => bail!("unexpected get-chunk response"),
         }
+    }
+
+    fn missing_chunks(&self, hashes: &[String]) -> Result<Vec<String>> {
+        match self.rpc(Request::MissingChunks {
+            hashes: hashes.to_vec(),
+        })? {
+            Response::Hashes(missing) => Ok(missing),
+            _ => bail!("unexpected missing-chunks response"),
+        }
+    }
+
+    fn put_chunks(&mut self, chunks: Vec<(String, Vec<u8>)>) -> Result<()> {
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0;
+        for (hash, bytes) in chunks {
+            if bytes.len() > TRANSFER_BUDGET_BYTES {
+                // A dropped connection loses the server's part staging, so
+                // restart the whole chunk once before giving up.
+                if self.put_chunk_in_parts(&hash, &bytes).is_err() {
+                    self.put_chunk_in_parts(&hash, &bytes)?;
+                }
+                continue;
+            }
+            if batch_bytes + bytes.len() > TRANSFER_BUDGET_BYTES && !batch.is_empty() {
+                expect_ok(self.rpc(Request::PutChunks {
+                    chunks: std::mem::take(&mut batch),
+                })?)?;
+                batch_bytes = 0;
+            }
+            batch_bytes += bytes.len();
+            batch.push((hash, bytes));
+        }
+        if !batch.is_empty() {
+            expect_ok(self.rpc(Request::PutChunks { chunks: batch })?)?;
+        }
+        Ok(())
+    }
+
+    fn get_chunks(
+        &self,
+        hashes: &[String],
+        sink: &mut dyn FnMut(&str, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let mut remaining: Vec<String> = hashes.to_vec();
+        while !remaining.is_empty() {
+            let delivered = match self.rpc(Request::GetChunks {
+                hashes: remaining.clone(),
+                budget: TRANSFER_BUDGET_BYTES as u64,
+            })? {
+                Response::Chunks(batch) => {
+                    if batch.is_empty() {
+                        bail!("authority returned no chunks for a non-empty request");
+                    }
+                    let count = batch.len();
+                    for (index, (hash, bytes)) in batch.into_iter().enumerate() {
+                        if remaining.get(index).map(String::as_str) != Some(hash.as_str()) {
+                            bail!("authority returned chunks out of order");
+                        }
+                        sink(&hash, bytes)?;
+                    }
+                    count
+                }
+                Response::Oversized { hash, total } => {
+                    if remaining.first() != Some(&hash) {
+                        bail!("authority returned an unexpected oversized chunk");
+                    }
+                    let bytes = self.get_chunk_in_parts(&hash, total)?;
+                    sink(&hash, bytes)?;
+                    1
+                }
+                _ => bail!("unexpected get-chunks response"),
+            };
+            remaining.drain(..delivered);
+        }
+        Ok(())
     }
 
     fn publish(&mut self, overlay: &Overlay, trunk_id: &str, now_ms: u64) -> Result<()> {
@@ -534,8 +724,8 @@ fn handle_connection(
     authority: &Arc<Mutex<FileAuthority>>,
     registry: &Arc<Mutex<Registry>>,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
     let hello = read_handshake_frame(&mut stream)?;
     let (hello, bytes_read): (Hello, usize) =
         bincode::serde::decode_from_slice(&hello, bincode::config::standard())
@@ -549,9 +739,27 @@ fn handle_connection(
             let key = lock(registry)?.device_key(&device_id)?;
             let mut session =
                 responder_handshake(&mut stream, &key).context("secure client handshake")?;
-            let request: Request = read_secure_message(&mut stream, &mut session)?;
-            let response = dispatch(request, &device_id, authority, registry, now_ms);
-            write_secure_message(&mut stream, &mut session, &response)
+            // The session carries many requests; it ends when the client
+            // disconnects or goes quiet past the read timeout.
+            let mut parts = PartState::default();
+            loop {
+                let request: Request = match read_secure_message(&mut stream, &mut session) {
+                    Ok(request) => request,
+                    Err(_) => return Ok(()),
+                };
+                // Revocation must cut off live sessions, not just new ones.
+                if lock(registry)?.device_key(&device_id).is_err() {
+                    let refused = Response::Error(format!("device {device_id} is not enrolled"));
+                    write_secure_message(&mut stream, &mut session, &refused)?;
+                    return Ok(());
+                }
+                let now_ms = SystemClock.now_ms();
+                let response = handle_parts(request, &mut parts, authority)
+                    .unwrap_or_else(|request| {
+                        dispatch(request, &device_id, authority, registry, now_ms)
+                    });
+                write_secure_message(&mut stream, &mut session, &response)?;
+            }
         }
         Hello::Enroll { code_id } => {
             let psk = lock(registry)?.enrollment_psk(&code_id, now_ms)?;
@@ -578,6 +786,87 @@ fn lock<'a, T>(value: &'a Arc<Mutex<T>>) -> Result<std::sync::MutexGuard<'a, T>>
     value
         .lock()
         .map_err(|_| anyhow::anyhow!("authority lock poisoned"))
+}
+
+#[derive(Default)]
+struct PartState {
+    /// In-flight chunk assembled from PutChunkPart requests.
+    staged: Option<(String, Vec<u8>)>,
+    /// Last chunk served via GetChunkPart, kept to avoid re-reading it per part.
+    cached: Option<(String, Vec<u8>)>,
+}
+
+/// Handle the stateful part-transfer requests; hand every other request back
+/// for regular dispatch.
+#[allow(clippy::result_large_err)]
+fn handle_parts(
+    request: Request,
+    parts: &mut PartState,
+    authority: &Arc<Mutex<FileAuthority>>,
+) -> Result<Response, Request> {
+    match request {
+        Request::PutChunkPart {
+            hash,
+            offset,
+            total,
+            bytes,
+        } => Ok(respond(|| {
+            if offset == 0 {
+                let capacity = usize::try_from(total).context("chunk too large")?;
+                let mut buffer = Vec::with_capacity(capacity.min(MAX_MESSAGE_BYTES * 8));
+                buffer.extend_from_slice(&bytes);
+                parts.staged = Some((hash.clone(), buffer));
+            } else {
+                let Some((staged_hash, buffer)) = parts.staged.as_mut() else {
+                    bail!("chunk part arrived without a started chunk");
+                };
+                if *staged_hash != hash || buffer.len() as u64 != offset {
+                    parts.staged = None;
+                    bail!("chunk part does not continue the started chunk");
+                }
+                buffer.extend_from_slice(&bytes);
+            }
+            let (staged_hash, buffer) = parts.staged.as_ref().expect("staged chunk");
+            if buffer.len() as u64 > total {
+                parts.staged = None;
+                bail!("chunk parts exceed the declared total");
+            }
+            if buffer.len() as u64 == total {
+                let (hash, buffer) = parts.staged.take().expect("staged chunk");
+                lock(authority)?.put_chunk(&hash, &buffer)?;
+            } else {
+                let _ = staged_hash;
+            }
+            Ok(Response::Ok)
+        })),
+        Request::GetChunkPart {
+            hash,
+            offset,
+            budget,
+        } => Ok(respond(|| {
+            if parts.cached.as_ref().map(|(cached, _)| cached.as_str()) != Some(hash.as_str()) {
+                parts.cached = Some((hash.clone(), lock(authority)?.get_chunk(&hash)?));
+            }
+            let (_, bytes) = parts.cached.as_ref().expect("cached chunk");
+            let total = bytes.len() as u64;
+            let start = usize::try_from(offset).context("chunk offset too large")?;
+            if start >= bytes.len() {
+                bail!("chunk part offset is past the end of {hash}");
+            }
+            let budget = usize::try_from(budget.clamp(1, TRANSFER_BUDGET_BYTES as u64))
+                .expect("budget fits usize");
+            let end = (start + budget).min(bytes.len());
+            Ok(Response::BytesPart {
+                total,
+                bytes: bytes[start..end].to_vec(),
+            })
+        })),
+        other => Err(other),
+    }
+}
+
+fn respond(body: impl FnOnce() -> Result<Response>) -> Response {
+    body().unwrap_or_else(|error| Response::Error(format!("{error:#}")))
 }
 
 fn dispatch(
@@ -634,6 +923,42 @@ fn dispatch(
             }
             Request::HasChunk { hash } => Response::Bool(authority.has_chunk(&hash)?),
             Request::GetChunk { hash } => Response::Bytes(authority.get_chunk(&hash)?),
+            Request::MissingChunks { hashes } => {
+                let mut missing = Vec::new();
+                for hash in hashes {
+                    if !authority.has_chunk(&hash)? {
+                        missing.push(hash);
+                    }
+                }
+                Response::Hashes(missing)
+            }
+            Request::PutChunks { chunks } => {
+                for (hash, bytes) in chunks {
+                    authority.put_chunk(&hash, &bytes)?;
+                }
+                Response::Ok
+            }
+            Request::GetChunks { hashes, budget } => {
+                let budget = usize::try_from(budget.clamp(1, TRANSFER_BUDGET_BYTES as u64))
+                    .expect("budget fits usize");
+                let mut batch = Vec::new();
+                let mut batch_bytes = 0;
+                for hash in hashes {
+                    let bytes = authority.get_chunk(&hash)?;
+                    if batch.is_empty() && bytes.len() > budget {
+                        return Ok(Response::Oversized {
+                            hash,
+                            total: bytes.len() as u64,
+                        });
+                    }
+                    if batch_bytes + bytes.len() > budget && !batch.is_empty() {
+                        break;
+                    }
+                    batch_bytes += bytes.len();
+                    batch.push((hash, bytes));
+                }
+                Response::Chunks(batch)
+            }
             Request::Publish {
                 overlay,
                 trunk_id,
