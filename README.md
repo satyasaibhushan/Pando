@@ -2,7 +2,7 @@
 
 Pando carries the state between your keyboard and the last push to every machine you use. Git remains history; Pando supplies presence.
 
-Phase 0 proved the two-machine handoff. The Phase 1 implementation now has folder-first onboarding, encrypted transport, background watchers, Git-aware working-tree capture, safe first-join merging, and interactive conflict resolution. Real-machine dogfooding remains the release gate.
+Phase 0 proved the two-machine handoff. The Phase 1 implementation now has device-first onboarding with one-time enrollment codes, per-device encrypted transport, background watchers, Git-aware working-tree capture, safe first-join merging, and interactive conflict resolution. Real-machine dogfooding remains the release gate.
 
 ## Build and test
 
@@ -17,44 +17,49 @@ Run the deterministic local handoff demo:
 cargo run -- demo
 ```
 
-## Folder-first setup
+## Getting started
 
-Build the release binary on both machines. On the always-on host, select one folder. Pando recursively discovers the Git repositories below it, assigns stable workspace IDs, generates a fabric key, seeds the local authority, and writes a secret invitation:
+Pando is device-first: machines join a network once, then pick which hosted folders they carry. Build the release binary on every machine.
 
-```sh
-pando setup host ~/Code \
-  --authority tcp://DEVBOX_IP:7337 \
-  --invite ~/pando-invite.json
-pando authority ~/Code --bind 0.0.0.0:7337
-```
-
-Allow TCP port 7337 through the host firewall. Transfer `pando-invite.json` securely to the other Mac; it is a bearer secret containing the shared fabric key. On the Mac, select the destination folder:
+On the first device — ideally the always-on one — bring up a network and host a folder. Pando recursively discovers the Git repositories below the folder, assigns stable workspace IDs, and installs background services (the authority plus one watcher per repository):
 
 ```sh
-pando setup join ~/Code --invite ~/pando-invite.json
+pando up
+pando share ~/Code --name code
 ```
 
-Existing disjoint files and subfolders are unioned on first join. If the same path differs, neither side is overwritten: Pando preserves the joining device as a pending version for an explicit decision in the TUI.
-
-Install one background watcher per discovered workspace on both machines:
+Allow TCP port 7337 through the host firewall. To admit another machine, print a one-time code:
 
 ```sh
-pando setup services ~/Code --activate
+pando invite
 ```
 
-The daemon watches changes, performs a full classified scan every 60 seconds, fetches Git remotes every 30 seconds, and synchronizes dirty files plus `.git` state without checking out, merging, rebasing, or pulling. Run a one-shot sync or inspect the saved network without supplying repository IDs, authority addresses, or keys:
+The code is single-use, expires in 15 minutes, and dies after 3 failed attempts. On the other machine, join the network and then any hosted folder:
 
 ```sh
-pando sync ~/Code
-pando status ~/Code
-pando tui ~/Code
+pando up --to HOST_IP:7337 --code xxxxx-xxxxx
+pando join code            # lands in ~/Pando/code, or pass a path
 ```
+
+Enrollment mints per-device credentials over an encrypted channel — nothing secret is copied between machines by hand, and `pando revoke <device>` expels a machine instantly. Existing disjoint files and subfolders are unioned on first join. If the same path differs, neither side is overwritten: Pando preserves the joining device as a pending version for an explicit decision in the TUI.
+
+Day-to-day commands:
+
+```sh
+pando            # dashboard (same as `pando tui`)
+pando folders    # folders hosted on the network
+pando devices    # machines on the network
+pando status     # per-folder sync state
+pando sync       # one-shot push of every joined folder
+```
+
+`up`, `share`, and `join` install launchd/systemd services automatically; pass `--no-services` to skip that. The daemon watches changes, performs a full classified scan every 60 seconds, fetches Git remotes every 30 seconds, and synchronizes dirty files plus `.git` state without checking out, merging, rebasing, or pulling.
 
 When a path changed on both devices, the TUI shows `Needs your decision`. It offers: keep the network version, keep this device, keep both copies, open the selected file in `$VISUAL`/`$EDITOR`, or publish a manual resolution. Every materializing choice asks for confirmation. The daemon remains non-interactive and never blocks waiting for terminal input.
 
-Every TCP RPC runs inside a Noise `NNpsk0` session using ChaCha20-Poly1305. The shared fabric key authenticates membership and encrypts traffic in transit; wrong-key and legacy plaintext clients are rejected. The self-hosted authority is trusted and stores the synchronized data in readable form on that machine, just as the endpoint machines do. Ciphertext-only storage and individual enrollment/revocation are required before a hosted, untrusted Pando authority.
+Every TCP RPC runs inside a Noise `NNpsk0` session using ChaCha20-Poly1305. Each device holds its own transport key, minted at enrollment; wrong-key and legacy plaintext clients are rejected, and revocation deletes the device's key from the registry. A separate network key encrypts escape bundles pushed to Git remotes — a revoked device keeps that key, so it can still read escape bundles it already had access to; rotate it if that matters. The self-hosted authority is trusted and stores the synchronized data in readable form on that machine, just as the endpoint machines do. Ciphertext-only storage is required before a hosted, untrusted Pando authority.
 
-The lower-level `serve`, `watch`, `service`, `push`, `pull`, and `reconcile` commands remain available for diagnostics and custom deployments.
+The lower-level `serve`, `watch`, `reconcile`, `verify`, `gc`, and `restore` commands remain available (hidden from `--help`) for diagnostics and custom deployments.
 
 ## Classification
 
@@ -99,14 +104,10 @@ pando hydrate --repo ~/Code/project
 Or opt in to running changed recipes after the watcher applies a remote snapshot:
 
 ```sh
-pando watch \
-  --repo ~/Code/project \
-  --repo-id project \
-  --trunk-id macbook \
-  --authority tcp://linuxbox.local:7337 \
-  --key "$PANDO_KEY" \
-  --rehydrate
+pando watch <workspace-id> --rehydrate
 ```
+
+Workspace IDs are listed by `pando folders`; the watcher reads everything else (paths, authority address, keys) from the device configuration.
 
 Pando invokes only these known executables directly—never through a shell—and caches successful fingerprints outside the repository. Supported lockfile recipes cover npm, pnpm, Yarn, Bun, uv, Poetry, Cargo, and Go. Successful `node_modules` and virtual-environment outputs are archived into a per-platform local artifact CAS; archives are keyed by their BLAKE3 content hash and re-verified before restoration. If a matching derived tree is missing, Pando restores it from cache before running the package manager. Running `pando hydrate` proactively populates this same cache. Unchanged inputs are skipped, failed recipes are retried, and `pando hydrate --force` deliberately reruns every detected recipe. In watcher mode recipes run on a worker thread after materialization, so installs and downloads do not block snapshot, lease, fetch, or pull processing. Watcher events inside classified derived trees are ignored, so rebuilding `node_modules` or `.venv` does not publish snapshots.
 
@@ -114,23 +115,18 @@ Rehydration is opt-in because package managers can access the network and may ex
 
 ## Reconciling forks
 
-When two trunks change the same path from their last shared snapshot, Pando leaves the active authority head untouched and preserves the local tree as a pending fork. List pending forks with the same trunk arguments used by `push`:
+When two devices change the same path from their last shared snapshot, Pando leaves the active authority head untouched and preserves the local tree as a pending fork. The TUI is the primary way to resolve these; the equivalent plumbing lists pending forks for a joined folder:
 
 ```sh
-pando reconcile \
-  --repo ~/Code/project \
-  --repo-id project \
-  --trunk-id macbook \
-  --authority tcp://linuxbox.local:7337 \
-  --key "$PANDO_KEY"
+pando reconcile ~/Pando/code/project
 ```
 
 Resolve one explicitly:
 
 ```sh
-pando reconcile <trunk arguments> --fork <snapshot-id> --choice authority
-pando reconcile <trunk arguments> --fork <snapshot-id> --choice fork
-pando reconcile <trunk arguments> --fork <snapshot-id> --choice manual
+pando reconcile <folder> --fork <snapshot-id> --choice authority
+pando reconcile <folder> --fork <snapshot-id> --choice fork
+pando reconcile <folder> --fork <snapshot-id> --choice manual
 ```
 
 `authority` materializes the current authority tree. `fork` publishes the preserved fork as a new child of the current head. `manual` publishes the tree currently on disk after you resolve it yourself. The first two choices refuse if the working tree changed after the fork; this prevents a selection from silently erasing newer edits. Status and the TUI show the number and IDs of pending forks.

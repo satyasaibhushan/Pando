@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -654,17 +653,5 @@ impl Authority for FileAuthority {
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let parent = path.parent().context("state path has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.partial-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    let bytes = serde_json::to_vec_pretty(value)?;
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    crate::fsutil::atomic_json(path, value, false)
 }

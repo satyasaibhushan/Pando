@@ -1,5 +1,7 @@
 use crate::authority::{AcquireResult, Authority, AuthorityStatus, FileAuthority};
+use crate::clock::{Clock, SystemClock};
 use crate::model::{Overlay, SnapshotId};
+use crate::registry::{DeviceInfo, EnrollmentGrant, Registry, ShareRecord};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
@@ -57,7 +59,27 @@ impl TransportKey {
         Ok(Self(bytes))
     }
 
-    pub fn generate(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_hex(encoded: &str) -> Result<Self> {
+        let encoded = encoded.trim();
+        if encoded.len() != 64 || !encoded.is_ascii() {
+            bail!("key must contain exactly 64 hexadecimal characters");
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+                .context("key contains non-hexadecimal characters")?;
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn random() -> Result<Self> {
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("generate key: {error}"))?;
+        Ok(Self(bytes))
+    }
+
+    /// Persist this key at `path` (0600), refusing to overwrite an existing key.
+    pub fn store(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path
             .parent()
@@ -66,10 +88,7 @@ impl TransportKey {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create key directory {}", parent.display()))?;
         }
-        let mut bytes = [0; 32];
-        getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("generate key: {error}"))?;
-        let key = Self(bytes);
-        let encoded = key.hex();
+        let encoded = self.hex();
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -79,9 +98,15 @@ impl TransportKey {
         }
         let mut file = options
             .open(path)
-            .with_context(|| format!("create transport key {}", path.display()))?;
+            .with_context(|| format!("create key {}", path.display()))?;
         writeln!(file, "{encoded}")?;
         file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn generate(path: impl AsRef<Path>) -> Result<Self> {
+        let key = Self::random()?;
+        key.store(path)?;
         Ok(key)
     }
 
@@ -130,6 +155,7 @@ impl fmt::Debug for TransportKey {
 #[derive(Clone)]
 pub struct RemoteAuthority {
     address: String,
+    device_id: String,
     key: TransportKey,
 }
 
@@ -138,13 +164,35 @@ impl fmt::Debug for RemoteAuthority {
         formatter
             .debug_struct("RemoteAuthority")
             .field("address", &self.address)
+            .field("device_id", &self.device_id)
             .field("key_fingerprint", &self.key.fingerprint())
             .finish()
     }
 }
 
+/// Sent in the clear before the Noise handshake so the authority knows which
+/// pre-shared key to expect: an enrolled device's key, or one derived from a
+/// pending enrollment code.
+#[derive(Debug, Serialize, Deserialize)]
+enum Hello {
+    Device { device_id: String },
+    Enroll { code_id: String },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum Request {
+    Enroll {
+        device_name: String,
+    },
+    NewCode,
+    Devices,
+    RevokeDevice {
+        device_id: String,
+    },
+    UpsertShare {
+        share: ShareRecord,
+    },
+    Shares,
     Acquire {
         repo_id: String,
         trunk_id: String,
@@ -197,6 +245,14 @@ enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 enum Response {
     Ok,
+    Enrolled(EnrollmentGrant),
+    Code {
+        code: String,
+        address: String,
+        expires_at_ms: u64,
+    },
+    Devices(Vec<DeviceInfo>),
+    Shares(Vec<ShareRecord>),
     Acquire(AcquireResult),
     Bool(bool),
     Bytes(Vec<u8>),
@@ -207,23 +263,71 @@ enum Response {
     Error(String),
 }
 
+/// A freshly minted enrollment code plus where to point the new device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Invite {
+    pub code: String,
+    pub address: String,
+    pub expires_at_ms: u64,
+}
+
 impl RemoteAuthority {
-    pub fn new(address: impl Into<String>, key: TransportKey) -> Self {
+    pub fn new(
+        address: impl Into<String>,
+        device_id: impl Into<String>,
+        key: TransportKey,
+    ) -> Self {
         Self {
             address: address.into(),
+            device_id: device_id.into(),
             key,
         }
     }
 
+    pub fn invite(&self) -> Result<Invite> {
+        match self.rpc(Request::NewCode)? {
+            Response::Code {
+                code,
+                address,
+                expires_at_ms,
+            } => Ok(Invite {
+                code,
+                address,
+                expires_at_ms,
+            }),
+            _ => bail!("unexpected invite response"),
+        }
+    }
+
+    pub fn devices(&self) -> Result<Vec<DeviceInfo>> {
+        match self.rpc(Request::Devices)? {
+            Response::Devices(devices) => Ok(devices),
+            _ => bail!("unexpected devices response"),
+        }
+    }
+
+    pub fn revoke_device(&self, device_id: &str) -> Result<()> {
+        expect_ok(self.rpc(Request::RevokeDevice {
+            device_id: device_id.into(),
+        })?)
+    }
+
+    pub fn upsert_share(&self, share: ShareRecord) -> Result<()> {
+        expect_ok(self.rpc(Request::UpsertShare { share })?)
+    }
+
+    pub fn shares(&self) -> Result<Vec<ShareRecord>> {
+        match self.rpc(Request::Shares)? {
+            Response::Shares(shares) => Ok(shares),
+            _ => bail!("unexpected shares response"),
+        }
+    }
+
     fn rpc(&self, request: Request) -> Result<Response> {
-        let addresses = self
-            .address
-            .to_socket_addrs()
-            .with_context(|| format!("resolve authority {}", self.address))?;
-        let mut stream = connect_any(addresses, std::time::Duration::from_secs(5))
-            .with_context(|| format!("connect to authority {}", self.address))?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let mut stream = open_stream(&self.address)?;
+        write_handshake_frame(&mut stream, &encode_hello(&Hello::Device {
+            device_id: self.device_id.clone(),
+        })?)?;
         let mut session =
             initiator_handshake(&mut stream, &self.key).context("secure authority handshake")?;
         write_secure_message(&mut stream, &mut session, &request)?;
@@ -233,6 +337,44 @@ impl RemoteAuthority {
             other => Ok(other),
         }
     }
+}
+
+/// Join a network: authenticate with a one-time enrollment code and receive
+/// this device's minted credentials.
+pub fn enroll(address: &str, code: &str, device_name: &str) -> Result<EnrollmentGrant> {
+    let psk = TransportKey::from_bytes(crate::registry::enrollment_psk(code));
+    let mut stream = open_stream(address)?;
+    write_handshake_frame(&mut stream, &encode_hello(&Hello::Enroll {
+        code_id: crate::registry::code_id(code),
+    })?)?;
+    let mut session = initiator_handshake(&mut stream, &psk)
+        .context("enrollment refused; check the code and address")?;
+    write_secure_message(&mut stream, &mut session, &Request::Enroll {
+        device_name: device_name.to_owned(),
+    })?;
+    match read_secure_message(&mut stream, &mut session)? {
+        Response::Enrolled(grant) => Ok(grant),
+        Response::Error(message) => bail!(message),
+        _ => bail!("unexpected enrollment response"),
+    }
+}
+
+fn open_stream(address: &str) -> Result<TcpStream> {
+    let addresses = address
+        .to_socket_addrs()
+        .with_context(|| format!("resolve authority {address}"))?;
+    let stream = connect_any(addresses, std::time::Duration::from_secs(5))
+        .with_context(|| format!("connect to authority {address}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    Ok(stream)
+}
+
+fn encode_hello(hello: &Hello) -> Result<Vec<u8>> {
+    Ok(bincode::serde::encode_to_vec(
+        hello,
+        bincode::config::standard(),
+    )?)
 }
 
 fn connect_any(
@@ -359,24 +501,25 @@ impl Authority for RemoteAuthority {
     }
 }
 
-pub fn serve(address: &str, authority: FileAuthority, key: TransportKey) -> Result<()> {
+pub fn serve(address: &str, authority: FileAuthority, registry: Registry) -> Result<()> {
     let listener =
         TcpListener::bind(address).with_context(|| format!("bind authority to {address}"))?;
-    serve_listener(listener, authority, key)
+    serve_listener(listener, authority, registry)
 }
 
 pub fn serve_listener(
     listener: TcpListener,
     authority: FileAuthority,
-    key: TransportKey,
+    registry: Registry,
 ) -> Result<()> {
     let authority = Arc::new(Mutex::new(authority));
+    let registry = Arc::new(Mutex::new(registry));
     for stream in listener.incoming() {
         let authority = authority.clone();
+        let registry = registry.clone();
         let stream = stream?;
-        let key = key.clone();
         thread::spawn(move || {
-            if let Err(error) = handle_connection(stream, &authority, &key)
+            if let Err(error) = handle_connection(stream, &authority, &registry)
                 && std::env::var_os("PANDO_DEBUG").is_some()
             {
                 eprintln!("authority connection failed: {error:#}");
@@ -389,21 +532,91 @@ pub fn serve_listener(
 fn handle_connection(
     mut stream: TcpStream,
     authority: &Arc<Mutex<FileAuthority>>,
-    key: &TransportKey,
+    registry: &Arc<Mutex<Registry>>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut session = responder_handshake(&mut stream, key).context("secure client handshake")?;
-    let request: Request = read_secure_message(&mut stream, &mut session)?;
-    let response = dispatch(request, authority);
-    write_secure_message(&mut stream, &mut session, &response)
+    let hello = read_handshake_frame(&mut stream)?;
+    let (hello, bytes_read): (Hello, usize) =
+        bincode::serde::decode_from_slice(&hello, bincode::config::standard())
+            .context("decode client hello")?;
+    if bytes_read != hello_length(&hello)? {
+        bail!("client hello contains trailing bytes");
+    }
+    let now_ms = SystemClock.now_ms();
+    match hello {
+        Hello::Device { device_id } => {
+            let key = lock(registry)?.device_key(&device_id)?;
+            let mut session =
+                responder_handshake(&mut stream, &key).context("secure client handshake")?;
+            let request: Request = read_secure_message(&mut stream, &mut session)?;
+            let response = dispatch(request, &device_id, authority, registry, now_ms);
+            write_secure_message(&mut stream, &mut session, &response)
+        }
+        Hello::Enroll { code_id } => {
+            let psk = lock(registry)?.enrollment_psk(&code_id, now_ms)?;
+            let mut session =
+                responder_handshake(&mut stream, &psk).context("enrollment handshake")?;
+            let request: Request = read_secure_message(&mut stream, &mut session)?;
+            let response = match request {
+                Request::Enroll { device_name } => lock(registry)
+                    .and_then(|registry| registry.enroll_device(&code_id, &device_name, now_ms))
+                    .map(Response::Enrolled)
+                    .unwrap_or_else(|error| Response::Error(format!("{error:#}"))),
+                _ => Response::Error("this connection may only enroll".into()),
+            };
+            write_secure_message(&mut stream, &mut session, &response)
+        }
+    }
 }
 
-fn dispatch(request: Request, authority: &Arc<Mutex<FileAuthority>>) -> Response {
+fn hello_length(hello: &Hello) -> Result<usize> {
+    Ok(bincode::serde::encode_to_vec(hello, bincode::config::standard())?.len())
+}
+
+fn lock<'a, T>(value: &'a Arc<Mutex<T>>) -> Result<std::sync::MutexGuard<'a, T>> {
+    value
+        .lock()
+        .map_err(|_| anyhow::anyhow!("authority lock poisoned"))
+}
+
+fn dispatch(
+    request: Request,
+    caller: &str,
+    authority: &Arc<Mutex<FileAuthority>>,
+    registry: &Arc<Mutex<Registry>>,
+    now_ms: u64,
+) -> Response {
     let result = (|| -> Result<Response> {
-        let mut authority = authority
-            .lock()
-            .map_err(|_| anyhow::anyhow!("authority lock poisoned"))?;
+        match request {
+            Request::Enroll { .. } => {
+                bail!("enrollment requires a one-time code, not device credentials")
+            }
+            Request::NewCode => {
+                let registry = lock(registry)?;
+                let (code, expires_at_ms) = registry.new_code(now_ms)?;
+                return Ok(Response::Code {
+                    code,
+                    address: registry.advertised()?,
+                    expires_at_ms,
+                });
+            }
+            Request::Devices => return Ok(Response::Devices(lock(registry)?.devices()?)),
+            Request::RevokeDevice { device_id } => {
+                if device_id == caller {
+                    bail!("a device cannot revoke itself");
+                }
+                lock(registry)?.revoke_device(&device_id)?;
+                return Ok(Response::Ok);
+            }
+            Request::UpsertShare { share } => {
+                lock(registry)?.upsert_share(share)?;
+                return Ok(Response::Ok);
+            }
+            Request::Shares => return Ok(Response::Shares(lock(registry)?.shares()?)),
+            _ => {}
+        }
+        let mut authority = lock(authority)?;
         Ok(match request {
             Request::Acquire {
                 repo_id,
@@ -450,6 +663,7 @@ fn dispatch(request: Request, authority: &Arc<Mutex<FileAuthority>>) -> Response
             Request::Status { repo_id, now_ms } => {
                 Response::Status(authority.status(&repo_id, now_ms)?)
             }
+            _ => bail!("request was already handled"),
         })
     })();
     result.unwrap_or_else(|error| Response::Error(format!("{error:#}")))
@@ -598,6 +812,7 @@ mod tests {
         connect_any, handle_connection, read_secure_message, write_secure_message,
     };
     use crate::authority::FileAuthority;
+    use crate::registry::{Registry, random_hex};
     use std::io::{Cursor, ErrorKind, Read, Write};
     use std::net::{Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -658,9 +873,22 @@ mod tests {
         let authority = Arc::new(Mutex::new(
             FileAuthority::open(root.path().join("authority")).unwrap(),
         ));
+        let registry = Arc::new(Mutex::new(
+            Registry::create(
+                root.path(),
+                &random_hex(16).unwrap(),
+                "192.0.2.1:7337",
+                &TransportKey::from_bytes([7; 32]),
+                "aabbccdd00112233aabbccdd00112233",
+                "devbox",
+                &TransportKey::from_bytes([3; 32]),
+                1_000,
+            )
+            .unwrap(),
+        ));
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle_connection(stream, &authority, &TransportKey::from_bytes([3; 32])).unwrap_err()
+            handle_connection(stream, &authority, &registry).unwrap_err()
         });
         let request = bincode::serde::encode_to_vec(
             Request::Head {

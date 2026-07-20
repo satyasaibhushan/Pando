@@ -1,81 +1,118 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use pando::authority::{Authority, FileAuthority};
 use pando::classify::Classifier;
-use pando::clock::SystemClock;
+use pando::clock::{Clock, SystemClock};
+use pando::config::{DeviceConfig, ShareConfig};
 use pando::daemon::{WatchOptions, describe_pull, describe_push};
+use pando::registry::Registry;
 use pando::rehydrate::Hydrator;
 use pando::sync::{ReconcileChoice, Trunk};
 use pando::transport::{RemoteAuthority, TransportKey};
 use std::fs;
+use std::net::{IpAddr, UdpSocket};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = "Your working tree, on every device")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    Setup {
-        #[command(subcommand)]
-        command: SetupCommand,
+    /// Bring this device onto a Pando network (creates one on first use)
+    Up {
+        /// Address of an existing network's authority, from `pando invite`
+        #[arg(long, requires = "code")]
+        to: Option<String>,
+        /// One-time enrollment code, from `pando invite`
+        #[arg(long, requires = "to")]
+        code: Option<String>,
+        /// Name for this device (defaults to the hostname)
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "0.0.0.0:7337", hide = true)]
+        bind: String,
+        /// Skip installing background services
+        #[arg(long)]
+        no_services: bool,
     },
-    Sync {
-        #[arg(default_value = ".")]
+    /// Print a one-time code that lets another device join
+    Invite,
+    /// Host a folder on the network so other devices can join it
+    Share {
         folder: PathBuf,
+        /// Name other devices use to join (defaults to the folder's name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Skip installing background services
+        #[arg(long)]
+        no_services: bool,
     },
-    Authority {
-        #[arg(default_value = ".")]
-        folder: PathBuf,
+    /// Bring a hosted folder onto this device
+    Join {
+        name: String,
+        /// Where to put the folder (defaults to ~/Pando/<name>)
+        path: Option<PathBuf>,
+        /// Skip installing background services
+        #[arg(long)]
+        no_services: bool,
+    },
+    /// List the folders hosted on this network
+    Folders,
+    /// List the devices on this network
+    Devices,
+    /// Remove a device from the network
+    Revoke { device: String },
+    /// Show sync state for every joined folder
+    Status,
+    /// Push every joined folder now
+    Sync,
+    /// Open the dashboard
+    Tui,
+    #[command(hide = true)]
+    Serve {
         #[arg(long, default_value = "0.0.0.0:7337")]
         bind: String,
         #[arg(long)]
         data: Option<PathBuf>,
     },
-    Keygen {
+    #[command(hide = true)]
+    Watch {
+        workspace: String,
         #[arg(long)]
-        output: PathBuf,
+        rehydrate: bool,
     },
-    Serve {
-        #[arg(long, default_value = "0.0.0.0:7337")]
-        bind: String,
-        #[arg(long, default_value = ".pando-authority")]
-        data: PathBuf,
-        #[arg(long, env = "PANDO_KEY")]
-        key: PathBuf,
-    },
-    Push(TrunkArgs),
-    Pull(TrunkArgs),
+    #[command(hide = true)]
     Fetch {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    #[command(hide = true)]
     Escape {
         #[command(subcommand)]
         command: EscapeCommand,
     },
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommand,
-    },
+    #[command(hide = true)]
     Reconcile {
-        #[command(flatten)]
-        trunk: TrunkArgs,
+        #[arg(default_value = ".")]
+        folder: PathBuf,
         #[arg(long)]
         fork: Option<String>,
         #[arg(long, value_enum, requires = "fork")]
         choice: Option<CliReconcileChoice>,
     },
+    #[command(hide = true)]
     Hydrate {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         #[arg(long)]
         force: bool,
     },
+    #[command(hide = true)]
     Classify {
         path: PathBuf,
         #[arg(long, default_value = ".")]
@@ -83,50 +120,28 @@ enum Command {
         #[arg(long)]
         directory: bool,
     },
+    #[command(hide = true)]
     Verify {
-        #[arg(long, default_value = ".pando-authority")]
-        data: PathBuf,
+        #[arg(long)]
+        data: Option<PathBuf>,
     },
+    #[command(hide = true)]
     Gc {
-        #[arg(long, default_value = ".pando-authority")]
-        data: PathBuf,
+        #[arg(long)]
+        data: Option<PathBuf>,
         #[arg(long)]
         apply: bool,
     },
+    #[command(hide = true)]
     Restore {
-        #[arg(long, default_value = ".pando-authority")]
-        data: PathBuf,
+        #[arg(long)]
+        data: Option<PathBuf>,
         #[arg(long)]
         snapshot: String,
         #[arg(long)]
         destination: PathBuf,
     },
-    Watch {
-        #[command(flatten)]
-        trunk: TrunkArgs,
-        #[arg(long, default_value_t = 750)]
-        quiescence_ms: u64,
-        #[arg(long, default_value_t = 3_000)]
-        idle_ms: u64,
-        #[arg(long, default_value_t = 60)]
-        full_scan_secs: u64,
-        #[arg(long, default_value_t = 30)]
-        fetch_secs: u64,
-        #[arg(long, default_value_t = 600)]
-        escape_secs: u64,
-        #[arg(long, default_value = "origin")]
-        escape_remote: String,
-        #[arg(long)]
-        rehydrate: bool,
-    },
-    Status {
-        #[arg(default_value = ".")]
-        folder: PathBuf,
-    },
-    Tui {
-        #[arg(default_value = ".")]
-        folder: PathBuf,
-    },
+    #[command(hide = true)]
     Demo {
         #[arg(long, default_value = ".pando-demo")]
         root: PathBuf,
@@ -134,46 +149,10 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum SetupCommand {
-    Host {
-        #[arg(default_value = ".")]
-        folder: PathBuf,
-        #[arg(long)]
-        authority: String,
-        #[arg(long)]
-        device: Option<String>,
-        #[arg(long)]
-        key: Option<PathBuf>,
-        #[arg(long, default_value = "pando-invite.json")]
-        invite: PathBuf,
-        #[arg(long)]
-        no_sync: bool,
-    },
-    Join {
-        #[arg(default_value = ".")]
-        folder: PathBuf,
-        #[arg(long)]
-        invite: PathBuf,
-        #[arg(long)]
-        device: Option<String>,
-        #[arg(long)]
-        no_sync: bool,
-    },
-    Services {
-        #[arg(default_value = ".")]
-        folder: PathBuf,
-        #[arg(long)]
-        activate: bool,
-        #[arg(long)]
-        rehydrate: bool,
-    },
-}
-
-#[derive(Subcommand)]
 enum EscapeCommand {
     Export {
-        #[command(flatten)]
-        trunk: TrunkArgs,
+        #[arg(default_value = ".")]
+        folder: PathBuf,
         #[arg(long, default_value = "origin")]
         remote: String,
         #[arg(long)]
@@ -183,9 +162,9 @@ enum EscapeCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         #[arg(long)]
-        repo_id: String,
+        workspace_id: String,
         #[arg(long)]
-        trunk_id: String,
+        device_id: String,
         #[arg(long, env = "PANDO_KEY")]
         key: PathBuf,
         #[arg(long)]
@@ -195,50 +174,6 @@ enum EscapeCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum ServiceCommand {
-    Install {
-        #[command(flatten)]
-        trunk: TrunkArgs,
-        #[arg(long, value_enum)]
-        platform: Option<CliServicePlatform>,
-        #[arg(long)]
-        binary: Option<PathBuf>,
-        #[arg(long)]
-        output_directory: Option<PathBuf>,
-        #[arg(long)]
-        activate: bool,
-        #[arg(long, default_value_t = 750)]
-        quiescence_ms: u64,
-        #[arg(long, default_value_t = 3_000)]
-        idle_ms: u64,
-        #[arg(long, default_value_t = 60)]
-        full_scan_secs: u64,
-        #[arg(long, default_value_t = 30)]
-        fetch_secs: u64,
-        #[arg(long, default_value_t = 600)]
-        escape_secs: u64,
-        #[arg(long, default_value = "origin")]
-        escape_remote: String,
-        #[arg(long)]
-        rehydrate: bool,
-    },
-}
-
-#[derive(clap::Args)]
-struct TrunkArgs {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    #[arg(long)]
-    repo_id: String,
-    #[arg(long)]
-    trunk_id: String,
-    #[arg(long)]
-    authority: String,
-    #[arg(long, env = "PANDO_KEY")]
-    key: Option<PathBuf>,
-}
-
 #[derive(Clone, Copy, ValueEnum)]
 enum CliReconcileChoice {
     Authority,
@@ -246,133 +181,177 @@ enum CliReconcileChoice {
     Manual,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum CliServicePlatform {
-    Launchd,
-    Systemd,
-}
-
-impl From<CliServicePlatform> for pando::service::ServicePlatform {
-    fn from(value: CliServicePlatform) -> Self {
-        match value {
-            CliServicePlatform::Launchd => Self::Launchd,
-            CliServicePlatform::Systemd => Self::Systemd,
-        }
-    }
-}
-
 fn main() -> Result<()> {
-    match Cli::parse().command {
-        Command::Setup { command } => match command {
-            SetupCommand::Host {
-                folder,
-                authority,
-                device,
-                key,
-                invite,
-                no_sync,
-            } => {
-                let generated_key = key.is_none().then(|| {
-                    std::env::temp_dir().join(format!(
-                        "pando-setup-key-{}-{}.key",
-                        std::process::id(),
-                        pando::Clock::now_ms(&SystemClock)
-                    ))
-                });
-                let key_path = key.as_deref().or(generated_key.as_deref()).unwrap();
-                if generated_key.is_some() {
-                    TransportKey::generate(key_path)?;
-                }
-                let result = pando::config::create_host(
-                    &folder,
-                    &device.unwrap_or(default_device_name()),
-                    &authority,
-                    key_path,
-                    &invite,
+    let Some(command) = Cli::parse().command else {
+        return match pando::config::try_load()? {
+            Some(config) => pando::tui::run(config),
+            None => {
+                println!("This device is not on a Pando network yet.");
+                println!();
+                println!("  pando up                          start a new network here");
+                println!("  pando up --to <addr> --code <c>   join one (get both from `pando invite` on another device)");
+                Ok(())
+            }
+        };
+    };
+    match command {
+        Command::Up {
+            to,
+            code,
+            name,
+            bind,
+            no_services,
+        } => up(to, code, name, &bind, no_services),
+        Command::Invite => {
+            let config = pando::config::load()?;
+            let invite = remote(&config)?.invite()?;
+            let minutes = invite
+                .expires_at_ms
+                .saturating_sub(SystemClock.now_ms())
+                .div_ceil(60_000);
+            println!("On the new device, run:");
+            println!();
+            println!("  pando up --to {} --code {}", invite.address, invite.code);
+            println!();
+            println!("The code works once and expires in {minutes} minutes.");
+            Ok(())
+        }
+        Command::Share {
+            folder,
+            name,
+            no_services,
+        } => share(&folder, name, no_services),
+        Command::Join {
+            name,
+            path,
+            no_services,
+        } => join(&name, path, no_services),
+        Command::Folders => {
+            let config = pando::config::load()?;
+            let shares = remote(&config)?.shares()?;
+            if shares.is_empty() {
+                println!("no folders yet; host one with `pando share <folder>`");
+            }
+            for share in shares {
+                let joined = match config.share(&share.name) {
+                    Some(local) => format!("here at {}", local.path.display()),
+                    None => format!("join with `pando join {}`", share.name),
+                };
+                println!(
+                    "{}  hosted by {} · {} workspace(s) · {}",
+                    share.name,
+                    share.host,
+                    share.workspaces.len(),
+                    joined
                 );
-                if let Some(generated_key) = generated_key {
-                    let _ = fs::remove_file(generated_key);
-                }
-                let config = result?;
-                print_setup(&config);
-                println!("secret invitation: {}", invite.display());
-                if !no_sync {
-                    let mut authority = FileAuthority::open(config.authority_data_path())?;
-                    sync_config_with_authority(&config, &mut authority)?;
-                }
-                println!("next: pando authority {}", shell_hint(&config.root));
-                Ok(())
             }
-            SetupCommand::Join {
-                folder,
-                invite,
-                device,
-                no_sync,
-            } => {
-                let config = pando::config::join(
-                    &folder,
-                    &device.unwrap_or(default_device_name()),
-                    &invite,
-                )?;
-                print_setup(&config);
-                if !no_sync {
-                    sync_config(&config)?;
-                }
-                println!("next: pando tui {}", shell_hint(&config.root));
-                Ok(())
+            Ok(())
+        }
+        Command::Devices => {
+            let config = pando::config::load()?;
+            for device in remote(&config)?.devices()? {
+                println!(
+                    "{}  {}{}",
+                    &device.id[..12.min(device.id.len())],
+                    device.name,
+                    if device.id == config.device_id {
+                        "  (this device)"
+                    } else {
+                        ""
+                    }
+                );
             }
-            SetupCommand::Services {
-                folder,
-                activate,
-                rehydrate,
-            } => install_configured_services(&pando::config::load(&folder)?, activate, rehydrate),
-        },
-        Command::Sync { folder } => sync_config(&pando::config::load(&folder)?),
-        Command::Authority { folder, bind, data } => {
-            let config = pando::config::load(&folder)?;
-            let data = data.unwrap_or_else(|| config.authority_data_path());
-            let key = TransportKey::load(&config.key_path)?;
-            println!(
-                "Pando authority listening securely on {bind}; data at {}; key {}",
-                data.display(),
-                key.fingerprint()
-            );
-            pando::transport::serve(&bind, FileAuthority::open(data)?, key)
-        }
-        Command::Keygen { output } => {
-            let key = TransportKey::generate(&output)?;
-            println!(
-                "created transport key {} (fingerprint {})",
-                output.display(),
-                key.fingerprint()
-            );
             Ok(())
         }
-        Command::Serve { bind, data, key } => {
-            let key = TransportKey::load(key)?;
-            println!(
-                "Pando authority listening securely on {bind}; data at {}; key {}",
-                data.display(),
-                key.fingerprint()
-            );
-            pando::transport::serve(&bind, FileAuthority::open(data)?, key)
-        }
-        Command::Push(args) => {
-            let trunk = open_trunk(&args)?;
-            let mut authority = authority(&args.authority, args.key.as_deref())?;
-            let result = trunk.push(authority.as_mut(), &SystemClock)?;
-            trunk.release(authority.as_mut())?;
-            println!("{}", describe_push(&result));
+        Command::Revoke { device } => {
+            let config = pando::config::load()?;
+            let authority = remote(&config)?;
+            let matches: Vec<_> = authority
+                .devices()?
+                .into_iter()
+                .filter(|entry| entry.name == device || entry.id.starts_with(&device))
+                .collect();
+            let target = match matches.as_slice() {
+                [target] => target.clone(),
+                [] => bail!("no device named {device}; see `pando devices`"),
+                _ => bail!("{device} matches more than one device; use the ID"),
+            };
+            authority.revoke_device(&target.id)?;
+            println!("revoked {} ({})", target.name, &target.id[..12]);
             Ok(())
         }
-        Command::Pull(args) => {
-            let trunk = open_trunk(&args)?;
-            let authority = authority(&args.authority, args.key.as_deref())?;
+        Command::Status => {
+            let config = pando::config::load()?;
+            let authority = remote(&config)?;
             println!(
-                "{}",
-                describe_pull(&trunk.pull(authority.as_ref(), &SystemClock)?)
+                "network {} · device {}",
+                &config.network_id[..12.min(config.network_id.len())],
+                config.device_name
             );
+            for share in &config.shares {
+                for workspace in &share.workspaces {
+                    let status = authority.status(&workspace.id, SystemClock.now_ms())?;
+                    let state = if status.forks.is_empty() {
+                        "in sync".to_owned()
+                    } else {
+                        format!("needs decision ({})", status.forks.len())
+                    };
+                    println!("{}/{}: {state}", share.name, workspace.name);
+                }
+            }
             Ok(())
+        }
+        Command::Sync => {
+            let config = pando::config::load()?;
+            let mut authority = remote(&config)?;
+            push_shares(&config, &mut authority, None)
+        }
+        Command::Tui => pando::tui::run(pando::config::load()?),
+        Command::Serve { bind, data } => {
+            let data = match data {
+                Some(data) => data,
+                None => pando::config::authority_data_path()?,
+            };
+            let registry = Registry::open(&data)?;
+            println!(
+                "Pando authority for network {} listening on {bind}",
+                &registry.network_id()?[..12]
+            );
+            pando::transport::serve(&bind, FileAuthority::open(&data)?, registry)
+        }
+        Command::Watch {
+            workspace,
+            rehydrate,
+        } => {
+            let config = pando::config::load()?;
+            let (share, found) = config
+                .workspace_by_id(&workspace)
+                .with_context(|| format!("workspace {workspace} is not joined on this device"))?;
+            let trunk = Trunk::open(
+                config.workspace_path(share, found),
+                &found.id,
+                &config.device_id,
+            )?;
+            let escape_key = config.network_key().ok();
+            if escape_key.is_none() {
+                eprintln!("escape export disabled: network key is missing");
+            }
+            let authority = Box::new(remote(&config)?);
+            pando::daemon::watch(
+                trunk,
+                authority,
+                WatchOptions {
+                    escape_interval: if escape_key.is_some() {
+                        Duration::from_secs(600)
+                    } else {
+                        Duration::ZERO
+                    },
+                    escape_key,
+                    escape_remote: Some("origin".into()),
+                    rehydrate,
+                    ..WatchOptions::default()
+                },
+            )
         }
         Command::Fetch { repo } => {
             let report = pando::git::fetch_remotes(&repo)?;
@@ -399,22 +378,21 @@ fn main() -> Result<()> {
         }
         Command::Escape { command } => match command {
             EscapeCommand::Export {
-                trunk,
-                remote,
+                folder,
+                remote: escape_remote,
                 local_only,
             } => {
-                let key_path = trunk
-                    .key
-                    .as_deref()
-                    .context("escape export requires --key or PANDO_KEY")?;
-                let key = TransportKey::load(key_path)?;
-                let authority = authority(&trunk.authority, trunk.key.as_deref())?;
+                let config = pando::config::load()?;
+                let (share, workspace) = config
+                    .find_workspace(&folder)
+                    .with_context(|| format!("{} is not a joined folder", folder.display()))?;
+                let authority = remote(&config)?;
                 let report = pando::escape::export(
-                    &trunk.repo,
-                    &trunk.repo_id,
-                    authority.as_ref(),
-                    &key,
-                    (!local_only).then_some(remote.as_str()),
+                    &config.workspace_path(share, workspace),
+                    &workspace.id,
+                    &authority,
+                    &config.network_key()?,
+                    (!local_only).then_some(escape_remote.as_str()),
                 )?;
                 println!(
                     "{} {} chunks ({} bytes) from {} in {}{}",
@@ -429,14 +407,14 @@ fn main() -> Result<()> {
             }
             EscapeCommand::Restore {
                 repo,
-                repo_id,
-                trunk_id,
+                workspace_id,
+                device_id,
                 key,
                 destination,
                 fetch_remote,
             } => {
                 let key = TransportKey::load(key)?;
-                let reference = pando::escape::reference(&repo_id, &trunk_id);
+                let reference = pando::escape::reference(&workspace_id, &device_id);
                 if let Some(remote) = fetch_remote {
                     pando::escape::fetch_ref(&repo, &remote, &reference)?;
                 }
@@ -451,87 +429,25 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Command::Service { command } => match command {
-            ServiceCommand::Install {
-                trunk,
-                platform,
-                binary,
-                output_directory,
-                activate,
-                quiescence_ms,
-                idle_ms,
-                full_scan_secs,
-                fetch_secs,
-                escape_secs,
-                escape_remote,
-                rehydrate,
-            } => {
-                let key = trunk
-                    .key
-                    .as_deref()
-                    .context("service installation requires --key or PANDO_KEY")?
-                    .canonicalize()
-                    .context("resolve service key")?;
-                let repo = trunk
-                    .repo
-                    .canonicalize()
-                    .context("resolve service repository")?;
-                let binary = binary
-                    .unwrap_or(std::env::current_exe()?)
-                    .canonicalize()
-                    .context("resolve service binary")?;
-                let platform = platform
-                    .map(Into::into)
-                    .map(Ok)
-                    .unwrap_or_else(pando::service::ServicePlatform::native)?;
-                let report = pando::service::install(
-                    &pando::service::ServiceSpec {
-                        binary,
-                        repo,
-                        repo_id: trunk.repo_id,
-                        trunk_id: trunk.trunk_id,
-                        authority: trunk.authority,
-                        key,
-                        quiescence_ms,
-                        idle_ms,
-                        full_scan_secs,
-                        fetch_secs,
-                        escape_secs,
-                        escape_remote,
-                        rehydrate,
-                    },
-                    platform,
-                    output_directory.as_deref(),
-                    activate,
-                )?;
-                println!(
-                    "{} service {} at {}",
-                    if report.activated {
-                        "activated"
-                    } else {
-                        "installed"
-                    },
-                    report.service_name,
-                    report.path.display()
-                );
-                Ok(())
-            }
-        },
         Command::Reconcile {
-            trunk,
+            folder,
             fork,
             choice,
         } => {
-            let mut authority = authority(&trunk.authority, trunk.key.as_deref())?;
+            let config = pando::config::load()?;
+            let (share, workspace) = config
+                .find_workspace(&folder)
+                .with_context(|| format!("{} is not a joined folder", folder.display()))?;
+            let mut authority = remote(&config)?;
             let Some(fork) = fork else {
-                let forks = authority.forks(&trunk.repo_id)?;
+                let forks = authority.forks(&workspace.id)?;
                 if forks.is_empty() {
                     println!("no pending forks");
                 }
                 for fork in forks {
                     let overlay = authority.overlay(&fork)?;
                     println!(
-                        "{} parent={} trunk={} created_at_ms={}",
+                        "{} parent={} device={} created_at_ms={}",
                         fork,
                         overlay.snapshot.parent.as_deref().unwrap_or("none"),
                         overlay.snapshot.trunk_id,
@@ -545,8 +461,12 @@ fn main() -> Result<()> {
                 CliReconcileChoice::Fork => ReconcileChoice::Fork,
                 CliReconcileChoice::Manual => ReconcileChoice::Manual,
             };
-            let result =
-                open_trunk(&trunk)?.reconcile(authority.as_mut(), &SystemClock, &fork, choice)?;
+            let trunk = Trunk::open(
+                config.workspace_path(share, workspace),
+                &workspace.id,
+                &config.device_id,
+            )?;
+            let result = trunk.reconcile(&mut authority, &SystemClock, &fork, choice)?;
             println!(
                 "resolved fork {} at head {}",
                 result.resolved_fork, result.head
@@ -582,7 +502,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Verify { data } => {
-            let report = FileAuthority::open_existing(&data)?.verify()?;
+            let report = FileAuthority::open_existing(&authority_data(data)?)?.verify()?;
             println!(
                 "verified {} heads, {} snapshots, {} chunks ({} bytes)",
                 report.heads, report.overlays, report.chunks, report.bytes
@@ -590,7 +510,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Gc { data, apply } => {
-            let report = FileAuthority::open_existing(&data)?.garbage_collect(apply)?;
+            let report =
+                FileAuthority::open_existing(&authority_data(data)?)?.garbage_collect(apply)?;
             println!(
                 "{} {} unreachable snapshots and {} chunks ({} bytes)",
                 if report.applied {
@@ -612,7 +533,8 @@ fn main() -> Result<()> {
             snapshot,
             destination,
         } => {
-            let report = FileAuthority::open_existing(&data)?.restore(&snapshot, &destination)?;
+            let report = FileAuthority::open_existing(&authority_data(data)?)?
+                .restore(&snapshot, &destination)?;
             println!(
                 "restored {} files ({} bytes) from {} to {}",
                 report.files,
@@ -622,134 +544,264 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Watch {
-            trunk,
-            quiescence_ms,
-            idle_ms,
-            full_scan_secs,
-            fetch_secs,
-            escape_secs,
-            escape_remote,
-            rehydrate,
-        } => {
-            let escape_key = trunk.key.as_deref().map(TransportKey::load).transpose()?;
-            if escape_secs > 0 && escape_key.is_none() {
-                eprintln!("escape export disabled: provide --key or PANDO_KEY");
-            }
-            let authority = authority(&trunk.authority, trunk.key.as_deref())?;
-            let trunk = open_trunk(&trunk)?;
-            pando::daemon::watch(
-                trunk,
-                authority,
-                WatchOptions {
-                    quiescence: Duration::from_millis(quiescence_ms),
-                    idle_release: Duration::from_millis(idle_ms),
-                    full_scan_interval: Duration::from_secs(full_scan_secs),
-                    fetch_interval: Duration::from_secs(fetch_secs),
-                    escape_interval: if escape_key.is_some() {
-                        Duration::from_secs(escape_secs)
-                    } else {
-                        Duration::ZERO
-                    },
-                    escape_key,
-                    escape_remote: Some(escape_remote),
-                    rehydrate,
-                    ..WatchOptions::default()
-                },
-            )
-        }
-        Command::Status { folder } => status_config(&pando::config::load(&folder)?),
-        Command::Tui { folder } => pando::tui::run(pando::config::load(&folder)?),
         Command::Demo { root } => demo(&root),
     }
 }
 
-fn sync_config(config: &pando::config::DeviceConfig) -> Result<()> {
-    let mut authority = authority(&config.authority, Some(&config.key_path))?;
-    sync_config_with_authority(config, authority.as_mut())
-}
-
-fn sync_config_with_authority(
-    config: &pando::config::DeviceConfig,
-    authority: &mut dyn Authority,
+fn up(
+    to: Option<String>,
+    code: Option<String>,
+    name: Option<String>,
+    bind: &str,
+    no_services: bool,
 ) -> Result<()> {
-    for workspace in &config.workspaces {
-        let path = config.workspace_path(workspace);
-        let trunk = Trunk::open(&path, &workspace.id, &config.device_id)?;
-        let result = trunk.push(authority, &SystemClock)?;
-        trunk.release(authority)?;
-        println!("{}: {}", workspace.name, describe_push(&result));
-    }
-    Ok(())
-}
-
-fn status_config(config: &pando::config::DeviceConfig) -> Result<()> {
-    let authority = authority(&config.authority, Some(&config.key_path))?;
-    println!(
-        "network {} · device {}",
-        &config.network_id[..12],
-        config.device_name
-    );
-    for workspace in &config.workspaces {
-        let status = authority.status(&workspace.id, pando::Clock::now_ms(&SystemClock))?;
-        let state = if status.forks.is_empty() {
-            "in sync".to_owned()
-        } else {
-            format!("needs decision ({})", status.forks.len())
-        };
-        println!("{}: {state}", workspace.name);
-    }
-    Ok(())
-}
-
-fn install_configured_services(
-    config: &pando::config::DeviceConfig,
-    activate: bool,
-    rehydrate: bool,
-) -> Result<()> {
-    let binary = std::env::current_exe()?.canonicalize()?;
-    let platform = pando::service::ServicePlatform::native()?;
-    for workspace in &config.workspaces {
-        let report = pando::service::install(
-            &pando::service::ServiceSpec {
-                binary: binary.clone(),
-                repo: config.workspace_path(workspace),
-                repo_id: workspace.id.clone(),
-                trunk_id: config.device_id.clone(),
-                authority: config.authority.clone(),
-                key: config.key_path.clone(),
-                quiescence_ms: 750,
-                idle_ms: 3_000,
-                full_scan_secs: 60,
-                fetch_secs: 30,
-                escape_secs: 600,
-                escape_remote: "origin".into(),
-                rehydrate,
-            },
-            platform,
-            None,
-            activate,
-        )?;
-        println!("{}: {}", workspace.name, report.path.display());
-    }
-    Ok(())
-}
-
-fn print_setup(config: &pando::config::DeviceConfig) {
-    println!(
-        "network {} · device {} · {} workspace(s)",
-        &config.network_id[..12],
-        config.device_name,
-        config.workspaces.len()
-    );
-    for workspace in &config.workspaces {
+    if let Some(config) = pando::config::try_load()? {
+        if to.is_some() {
+            bail!(
+                "this device is already on network {}; revoke it there first to move it",
+                &config.network_id[..12]
+            );
+        }
         println!(
-            "  {}  {}",
-            workspace.name,
-            config.workspace_path(workspace).display()
+            "already on network {} as {}",
+            &config.network_id[..12],
+            config.device_name
         );
+        ensure_services(&config, no_services)?;
+        return Ok(());
     }
-    println!("managed key: {}", config.key_path.display());
+    let device_name = name.unwrap_or_else(default_device_name);
+    pando::config::validate_name(&device_name, "device")?;
+
+    let config = match (to, code) {
+        (Some(to), Some(code)) => {
+            let grant = pando::transport::enroll(&to, &code, &device_name)?;
+            TransportKey::from_hex(&grant.device_key)?.store(pando::config::device_key_path()?)?;
+            TransportKey::from_hex(&grant.network_key)?
+                .store(pando::config::network_key_path()?)?;
+            let config =
+                DeviceConfig::new(grant.network_id, grant.device_id, device_name.clone(), to);
+            pando::config::save(&config)?;
+            println!(
+                "joined network {} as {}",
+                &config.network_id[..12],
+                device_name
+            );
+            println!("next: `pando folders` to see what you can join");
+            config
+        }
+        (None, None) => {
+            let now = SystemClock.now_ms();
+            let port = bind.rsplit_once(':').map(|(_, port)| port).unwrap_or("7337");
+            let advertised = format!("{}:{port}", detect_ip());
+            let network_key = TransportKey::random()?;
+            let device_key = TransportKey::random()?;
+            let network_id = pando::registry::random_hex(16)?;
+            let device_id = pando::registry::random_hex(16)?;
+            Registry::create(
+                &pando::config::authority_data_path()?,
+                &network_id,
+                &advertised,
+                &network_key,
+                &device_id,
+                &device_name,
+                &device_key,
+                now,
+            )?;
+            device_key.store(pando::config::device_key_path()?)?;
+            network_key.store(pando::config::network_key_path()?)?;
+            let config = DeviceConfig::new(
+                network_id,
+                device_id,
+                device_name.clone(),
+                format!("127.0.0.1:{port}"),
+            );
+            pando::config::save(&config)?;
+            println!(
+                "created network {} · this device is {} and hosts the authority at {advertised}",
+                &config.network_id[..12],
+                device_name
+            );
+            println!("next: `pando invite` to add a device, `pando share <folder>` to host code");
+            config
+        }
+        _ => unreachable!("clap enforces --to and --code together"),
+    };
+    ensure_services(&config, no_services)
+}
+
+fn share(folder: &Path, name: Option<String>, no_services: bool) -> Result<()> {
+    let mut config = pando::config::load()?;
+    let root = pando::config::canonical_directory(folder)?;
+    let name = match name {
+        Some(name) => name,
+        None => root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("folder has no usable name; pass --name")?
+            .to_owned(),
+    };
+    pando::config::validate_name(&name, "share")?;
+    let workspaces = pando::config::discover(&root)?
+        .into_iter()
+        .map(|relative| pando::config::workspace(&config.network_id, &name, &root, relative))
+        .collect::<Result<Vec<_>>>()?;
+    let mut authority = remote(&config)?;
+    authority.upsert_share(pando::registry::ShareRecord {
+        name: name.clone(),
+        host: config.device_name.clone(),
+        workspaces: workspaces.clone(),
+    })?;
+    config.upsert_share(ShareConfig {
+        name: name.clone(),
+        path: root,
+        workspaces,
+    });
+    pando::config::save(&config)?;
+    println!("hosting {name} · join it elsewhere with `pando join {name}`");
+    push_shares(&config, &mut authority, Some(&name))?;
+    ensure_services(&config, no_services)
+}
+
+fn join(name: &str, path: Option<PathBuf>, no_services: bool) -> Result<()> {
+    let mut config = pando::config::load()?;
+    let authority = remote(&config)?;
+    let shares = authority.shares()?;
+    let Some(share) = shares.iter().find(|share| share.name == name) else {
+        let available = shares
+            .iter()
+            .map(|share| share.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "no folder named {name} on this network{}",
+            if available.is_empty() {
+                "; host one with `pando share <folder>`".to_owned()
+            } else {
+                format!("; available: {available}")
+            }
+        );
+    };
+    let path = match path {
+        Some(path) => path,
+        None => home_directory()?.join("Pando").join(name),
+    };
+    fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
+    let path = path.canonicalize()?;
+    let local = ShareConfig {
+        name: share.name.clone(),
+        path,
+        workspaces: share.workspaces.clone(),
+    };
+    for workspace in &local.workspaces {
+        let workspace_path = config.workspace_path(&local, workspace);
+        fs::create_dir_all(&workspace_path)?;
+        let trunk = Trunk::open(&workspace_path, &workspace.id, &config.device_id)?;
+        let result = trunk.pull(&authority, &SystemClock)?;
+        println!("{}/{}: {}", name, workspace.name, describe_pull(&result));
+    }
+    config.upsert_share(local);
+    pando::config::save(&config)?;
+    ensure_services(&config, no_services)
+}
+
+fn push_shares(
+    config: &DeviceConfig,
+    authority: &mut dyn Authority,
+    only: Option<&str>,
+) -> Result<()> {
+    for share in &config.shares {
+        if only.is_some_and(|name| name != share.name) {
+            continue;
+        }
+        for workspace in &share.workspaces {
+            let path = config.workspace_path(share, workspace);
+            let trunk = Trunk::open(&path, &workspace.id, &config.device_id)?;
+            let result = trunk.push(authority, &SystemClock)?;
+            trunk.release(authority)?;
+            println!("{}/{}: {}", share.name, workspace.name, describe_push(&result));
+        }
+    }
+    Ok(())
+}
+
+/// Install (or refresh) the background services this device needs: the
+/// authority when it hosts one, and a watcher per joined workspace.
+fn ensure_services(config: &DeviceConfig, no_services: bool) -> Result<()> {
+    if no_services {
+        return Ok(());
+    }
+    let binary = std::env::current_exe()?.canonicalize()?;
+    let platform = match pando::service::ServicePlatform::native() {
+        Ok(platform) => platform,
+        Err(error) => {
+            eprintln!("services not installed: {error}; run `pando serve` and `pando watch` manually");
+            return Ok(());
+        }
+    };
+    let mut kinds = Vec::new();
+    if hosts_authority(config) {
+        kinds.push(pando::service::ServiceKind::Authority);
+    }
+    for share in &config.shares {
+        for workspace in &share.workspaces {
+            kinds.push(pando::service::ServiceKind::Watch {
+                workspace_id: workspace.id.clone(),
+            });
+        }
+    }
+    for kind in kinds {
+        let report = pando::service::install(&kind, &binary, platform, None, true)?;
+        println!("service {} running", report.service_name);
+    }
+    Ok(())
+}
+
+fn hosts_authority(config: &DeviceConfig) -> bool {
+    config.authority.starts_with("127.0.0.1:") || config.authority.starts_with("localhost:")
+}
+
+fn remote(config: &DeviceConfig) -> Result<RemoteAuthority> {
+    Ok(RemoteAuthority::new(
+        config.authority.clone(),
+        config.device_id.clone(),
+        config.device_key()?,
+    ))
+}
+
+/// Best local IP to advertise, discovered by routing (no packets sent).
+/// A Tailscale-style CGNAT address wins because it is stable across networks.
+fn detect_ip() -> String {
+    let probe = |target: &str| -> Option<IpAddr> {
+        let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect(target).ok()?;
+        Some(socket.local_addr().ok()?.ip())
+    };
+    if let Some(ip) = probe("100.100.100.100:53")
+        && is_cgnat(ip)
+    {
+        return ip.to_string();
+    }
+    probe("8.8.8.8:53")
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".into())
+}
+
+fn is_cgnat(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+}
+
+fn authority_data(data: Option<PathBuf>) -> Result<PathBuf> {
+    match data {
+        Some(data) => Ok(data),
+        None => pando::config::authority_data_path(),
+    }
+}
+
+fn home_directory() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
 }
 
 fn default_device_name() -> String {
@@ -762,17 +814,6 @@ fn default_device_name() -> String {
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "device".into())
-}
-
-fn shell_hint(path: &Path) -> String {
-    let rendered = path.display().to_string();
-    if rendered.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
-    }) {
-        rendered
-    } else {
-        format!("{:?}", rendered)
-    }
 }
 
 fn classification_path(repo: &Path, path: &Path) -> Result<PathBuf> {
@@ -795,25 +836,9 @@ fn classification_path(repo: &Path, path: &Path) -> Result<PathBuf> {
             )
         })
     {
-        anyhow::bail!("classification path must be a path inside the repository");
+        bail!("classification path must be a path inside the repository");
     }
     Ok(relative.to_owned())
-}
-
-fn open_trunk(args: &TrunkArgs) -> Result<Trunk> {
-    Trunk::open(&args.repo, &args.repo_id, &args.trunk_id)
-}
-
-fn authority(endpoint: &str, key: Option<&Path>) -> Result<Box<dyn Authority>> {
-    if let Some(address) = endpoint.strip_prefix("tcp://") {
-        let key_path = key.context("TCP authority requires --key or PANDO_KEY")?;
-        Ok(Box::new(RemoteAuthority::new(
-            address,
-            TransportKey::load(key_path)?,
-        )))
-    } else {
-        Ok(Box::new(FileAuthority::open(endpoint)?))
-    }
 }
 
 fn demo(root: &Path) -> Result<()> {

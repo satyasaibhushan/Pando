@@ -1,6 +1,6 @@
+use crate::fsutil::atomic_write;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,21 +22,32 @@ impl ServicePlatform {
     }
 }
 
+/// The two background jobs Pando runs: the network authority, and one file
+/// watcher per workspace. All configuration lives in the device config, so
+/// units carry nothing but the subcommand.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServiceSpec {
-    pub binary: PathBuf,
-    pub repo: PathBuf,
-    pub repo_id: String,
-    pub trunk_id: String,
-    pub authority: String,
-    pub key: PathBuf,
-    pub quiescence_ms: u64,
-    pub idle_ms: u64,
-    pub full_scan_secs: u64,
-    pub fetch_secs: u64,
-    pub escape_secs: u64,
-    pub escape_remote: String,
-    pub rehydrate: bool,
+pub enum ServiceKind {
+    Authority,
+    Watch { workspace_id: String },
+}
+
+impl ServiceKind {
+    fn name(&self) -> String {
+        match self {
+            Self::Authority => "io.pando.authority".into(),
+            Self::Watch { workspace_id } => {
+                format!("io.pando.watch.{}", &workspace_id[..workspace_id.len().min(12)])
+            }
+        }
+    }
+
+    fn arguments(&self, binary: &Path) -> Vec<String> {
+        let binary = binary.display().to_string();
+        match self {
+            Self::Authority => vec![binary, "serve".into()],
+            Self::Watch { workspace_id } => vec![binary, "watch".into(), workspace_id.clone()],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,36 +58,42 @@ pub struct InstallReport {
 }
 
 pub fn install(
-    spec: &ServiceSpec,
+    kind: &ServiceKind,
+    binary: &Path,
     platform: ServicePlatform,
     output_directory: Option<&Path>,
     activate: bool,
 ) -> Result<InstallReport> {
-    validate(spec)?;
+    if !binary.is_absolute() || !binary.is_file() {
+        bail!(
+            "service binary must be an existing absolute path: {}",
+            binary.display()
+        );
+    }
     if activate && output_directory.is_some() {
         bail!("cannot activate a service written to a custom output directory");
     }
-    let service_name = service_name(spec);
+    let service_name = kind.name();
     let (directory, filename, contents) = match platform {
         ServicePlatform::Launchd => {
             let directory = output_directory
                 .map(Path::to_owned)
                 .unwrap_or(default_launchd_directory()?);
             let filename = format!("{service_name}.plist");
-            (directory, filename, render_launchd(spec, &service_name))
+            (directory, filename, render_launchd(kind, binary, &service_name))
         }
         ServicePlatform::Systemd => {
             let directory = output_directory
                 .map(Path::to_owned)
                 .unwrap_or(default_systemd_directory()?);
             let filename = format!("{service_name}.service");
-            (directory, filename, render_systemd(spec))
+            (directory, filename, render_systemd(kind, binary, &service_name))
         }
     };
     fs::create_dir_all(&directory)
         .with_context(|| format!("create service directory {}", directory.display()))?;
     let path = directory.join(filename);
-    atomic_write(&path, contents.as_bytes())?;
+    atomic_write(&path, contents.as_bytes(), false)?;
     if activate {
         activate_service(platform, &service_name, &path)?;
     }
@@ -87,74 +104,9 @@ pub fn install(
     })
 }
 
-fn validate(spec: &ServiceSpec) -> Result<()> {
-    if !spec.binary.is_absolute() || !spec.binary.is_file() {
-        bail!(
-            "service binary must be an existing absolute path: {}",
-            spec.binary.display()
-        );
-    }
-    if !spec.repo.is_absolute() || !spec.repo.is_dir() {
-        bail!(
-            "service repository must be an existing absolute path: {}",
-            spec.repo.display()
-        );
-    }
-    if !spec.key.is_absolute() || !spec.key.is_file() {
-        bail!(
-            "service key must be an existing absolute path: {}",
-            spec.key.display()
-        );
-    }
-    if spec.repo_id.is_empty() || spec.trunk_id.is_empty() || spec.authority.is_empty() {
-        bail!("service repository, trunk, and authority identifiers cannot be empty");
-    }
-    Ok(())
-}
-
-fn service_name(spec: &ServiceSpec) -> String {
-    let identity = format!("{}\0{}", spec.repo_id, spec.trunk_id);
-    format!(
-        "io.pando.watch.{}",
-        &blake3::hash(identity.as_bytes()).to_hex()[..12]
-    )
-}
-
-fn arguments(spec: &ServiceSpec) -> Vec<String> {
-    let mut arguments = vec![
-        spec.binary.display().to_string(),
-        "watch".into(),
-        "--repo".into(),
-        spec.repo.display().to_string(),
-        "--repo-id".into(),
-        spec.repo_id.clone(),
-        "--trunk-id".into(),
-        spec.trunk_id.clone(),
-        "--authority".into(),
-        spec.authority.clone(),
-        "--key".into(),
-        spec.key.display().to_string(),
-        "--quiescence-ms".into(),
-        spec.quiescence_ms.to_string(),
-        "--idle-ms".into(),
-        spec.idle_ms.to_string(),
-        "--full-scan-secs".into(),
-        spec.full_scan_secs.to_string(),
-        "--fetch-secs".into(),
-        spec.fetch_secs.to_string(),
-        "--escape-secs".into(),
-        spec.escape_secs.to_string(),
-        "--escape-remote".into(),
-        spec.escape_remote.clone(),
-    ];
-    if spec.rehydrate {
-        arguments.push("--rehydrate".into());
-    }
-    arguments
-}
-
-fn render_launchd(spec: &ServiceSpec, label: &str) -> String {
-    let arguments = arguments(spec)
+fn render_launchd(kind: &ServiceKind, binary: &Path, label: &str) -> String {
+    let arguments = kind
+        .arguments(binary)
         .iter()
         .map(|argument| format!("    <string>{}</string>\n", xml_escape(argument)))
         .collect::<String>();
@@ -175,17 +127,17 @@ fn render_launchd(spec: &ServiceSpec, label: &str) -> String {
     )
 }
 
-fn render_systemd(spec: &ServiceSpec) -> String {
-    let command = arguments(spec)
+fn render_systemd(kind: &ServiceKind, binary: &Path, name: &str) -> String {
+    let command = kind
+        .arguments(binary)
         .iter()
         .map(|argument| systemd_quote(argument))
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "[Unit]\nDescription=Pando working-tree continuity for {}\nAfter=network-online.target\nWants=network-online.target\n\n\
+        "[Unit]\nDescription=Pando {name}\nAfter=network-online.target\nWants=network-online.target\n\n\
 [Service]\nType=simple\nExecStart={command}\nRestart=on-failure\nRestartSec=3\n\n\
-[Install]\nWantedBy=default.target\n",
-        spec.repo_id.replace('\n', " ")
+[Install]\nWantedBy=default.target\n"
     )
 }
 
@@ -225,15 +177,6 @@ fn home_directory() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")
-}
-
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let temporary = path.with_extension(format!("partial-{}", std::process::id()));
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
-    Ok(())
 }
 
 fn activate_service(platform: ServicePlatform, service_name: &str, path: &Path) -> Result<()> {
@@ -293,46 +236,44 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn spec(root: &Path) -> ServiceSpec {
-        let binary = root.join("pando");
-        let repo = root.join("repo & work");
-        let key = root.join("fabric.key");
-        fs::write(&binary, "binary").unwrap();
-        fs::create_dir(&repo).unwrap();
-        fs::write(&key, "key").unwrap();
-        ServiceSpec {
-            binary,
-            repo,
-            repo_id: "project".into(),
-            trunk_id: "macbook".into(),
-            authority: "tcp://host:7337".into(),
-            key,
-            quiescence_ms: 750,
-            idle_ms: 3_000,
-            full_scan_secs: 60,
-            fetch_secs: 30,
-            escape_secs: 600,
-            escape_remote: "origin".into(),
-            rehydrate: true,
-        }
-    }
-
     #[test]
     fn installs_launchd_and_systemd_units_without_a_shell() {
         let root = tempfile::tempdir().unwrap();
-        let spec = spec(root.path());
+        let binary = root.path().join("pando & tools");
+        fs::write(&binary, "binary").unwrap();
+        let kind = ServiceKind::Watch {
+            workspace_id: "aabbccddeeff00112233".into(),
+        };
+
         let launchd_dir = root.path().join("launchd");
-        let launchd = install(&spec, ServicePlatform::Launchd, Some(&launchd_dir), false).unwrap();
+        let launchd = install(
+            &kind,
+            &binary,
+            ServicePlatform::Launchd,
+            Some(&launchd_dir),
+            false,
+        )
+        .unwrap();
+        assert_eq!(launchd.service_name, "io.pando.watch.aabbccddeeff");
         let plist = fs::read_to_string(launchd.path).unwrap();
         assert!(plist.contains("<string>watch</string>"));
-        assert!(plist.contains("repo &amp; work"));
+        assert!(plist.contains("<string>aabbccddeeff00112233</string>"));
+        assert!(plist.contains("pando &amp; tools"));
         assert!(!plist.contains("sh -c"));
 
         let systemd_dir = root.path().join("systemd");
-        let systemd = install(&spec, ServicePlatform::Systemd, Some(&systemd_dir), false).unwrap();
+        let systemd = install(
+            &ServiceKind::Authority,
+            &binary,
+            ServicePlatform::Systemd,
+            Some(&systemd_dir),
+            false,
+        )
+        .unwrap();
+        assert_eq!(systemd.service_name, "io.pando.authority");
         let unit = fs::read_to_string(systemd.path).unwrap();
         assert!(unit.contains("ExecStart="));
-        assert!(unit.contains("\"watch\""));
+        assert!(unit.contains("\"serve\""));
         assert!(!unit.contains("/bin/sh"));
     }
 }

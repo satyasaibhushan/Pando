@@ -1,9 +1,9 @@
-use crate::authority::{Authority, AuthorityStatus, FileAuthority};
+use crate::authority::{Authority, AuthorityStatus};
 use crate::clock::{Clock, SystemClock};
-use crate::config::DeviceConfig;
+use crate::config::{DeviceConfig, WorkspaceConfig};
 use crate::model::short_id;
 use crate::sync::{ForkConflict, ReconcileChoice, Trunk};
-use crate::transport::{RemoteAuthority, TransportKey};
+use crate::transport::RemoteAuthority;
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
@@ -39,29 +39,48 @@ impl PendingAction {
     }
 }
 
+/// One row in the workspace list: a workspace plus where it lives on disk.
+struct Entry {
+    label: String,
+    path: std::path::PathBuf,
+    workspace: WorkspaceConfig,
+}
+
+fn entries(config: &DeviceConfig) -> Vec<Entry> {
+    let many_shares = config.shares.len() > 1;
+    config
+        .shares
+        .iter()
+        .flat_map(|share| {
+            share.workspaces.iter().map(move |workspace| Entry {
+                label: if many_shares {
+                    format!("{}/{}", share.name, workspace.name)
+                } else {
+                    workspace.name.clone()
+                },
+                path: config.workspace_path(share, workspace),
+                workspace: workspace.clone(),
+            })
+        })
+        .collect()
+}
+
 pub fn run(config: DeviceConfig) -> Result<()> {
-    let mut authority = open_authority(&config)?;
+    let mut authority = RemoteAuthority::new(
+        config.authority.clone(),
+        config.device_id.clone(),
+        config.device_key()?,
+    );
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal, authority.as_mut(), &config);
+    let result = run_loop(&mut terminal, &mut authority, &config);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
-}
-
-fn open_authority(config: &DeviceConfig) -> Result<Box<dyn Authority>> {
-    if let Some(address) = config.authority.strip_prefix("tcp://") {
-        Ok(Box::new(RemoteAuthority::new(
-            address,
-            TransportKey::load(&config.key_path)?,
-        )))
-    } else {
-        Ok(Box::new(FileAuthority::open(&config.authority)?))
-    }
 }
 
 fn run_loop(
@@ -70,13 +89,20 @@ fn run_loop(
     config: &DeviceConfig,
 ) -> Result<()> {
     let clock = SystemClock;
+    let entries = entries(config);
     let mut selected_workspace = 0usize;
     let mut selected_conflict = 0usize;
     let mut pending: Option<PendingAction> = None;
     let mut notice = String::new();
 
     loop {
-        let workspace = &config.workspaces[selected_workspace];
+        let Some(entry) = entries.get(selected_workspace) else {
+            if empty_screen(terminal)? {
+                return Ok(());
+            }
+            continue;
+        };
+        let workspace = &entry.workspace;
         let status = authority.status(&workspace.id, clock.now_ms());
         let forks = status
             .as_ref()
@@ -85,12 +111,8 @@ fn run_loop(
         let fork = forks.first();
         let conflicts = fork
             .map(|fork| {
-                Trunk::open(
-                    config.workspace_path(workspace),
-                    &workspace.id,
-                    &config.device_id,
-                )?
-                .fork_conflicts(authority, fork)
+                Trunk::open(entry.path.clone(), &workspace.id, &config.device_id)?
+                    .fork_conflicts(authority, fork)
             })
             .transpose()
             .unwrap_or_else(|error| {
@@ -121,8 +143,7 @@ fn run_loop(
             frame.render_widget(
                 Paragraph::new(format!(
                     " PANDO · {} · {} ",
-                    config.device_name,
-                    config.root.display()
+                    config.device_name, config.authority
                 ))
                 .style(
                     Style::default()
@@ -133,17 +154,16 @@ fn run_loop(
                 vertical[0],
             );
 
-            let items = config
-                .workspaces
+            let items = entries
                 .iter()
                 .enumerate()
-                .map(|(index, workspace)| {
+                .map(|(index, entry)| {
                     let marker = if index == selected_workspace {
                         "›"
                     } else {
                         " "
                     };
-                    ListItem::new(format!("{marker} {}", workspace.name))
+                    ListItem::new(format!("{marker} {}", entry.label))
                 })
                 .collect::<Vec<_>>();
             let mut state = ListState::default().with_selected(Some(selected_workspace));
@@ -157,7 +177,7 @@ fn run_loop(
 
             frame.render_widget(
                 Paragraph::new(workspace_body(
-                    workspace.name.as_str(),
+                    entry.label.as_str(),
                     status.as_ref(),
                     &conflicts,
                     selected_conflict,
@@ -208,11 +228,8 @@ fn run_loop(
                         pending = None;
                         continue;
                     };
-                    let trunk = Trunk::open(
-                        config.workspace_path(workspace),
-                        &workspace.id,
-                        &config.device_id,
-                    )?;
+                    let trunk =
+                        Trunk::open(entry.path.clone(), &workspace.id, &config.device_id)?;
                     let result = match action {
                         PendingAction::Authority => {
                             trunk.reconcile(authority, &clock, fork, ReconcileChoice::Authority)
@@ -245,7 +262,7 @@ fn run_loop(
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 selected_workspace =
-                    (selected_workspace + 1).min(config.workspaces.len().saturating_sub(1));
+                    (selected_workspace + 1).min(entries.len().saturating_sub(1));
                 selected_conflict = 0;
                 notice.clear();
             }
@@ -264,15 +281,35 @@ fn run_loop(
                 if conflict.path == ".git" || conflict.path.starts_with(".git/") {
                     notice = "Git metadata conflicts cannot be opened in an editor".into();
                 } else {
-                    notice = edit_file(
-                        terminal,
-                        &config.workspace_path(workspace).join(&conflict.path),
-                    )?;
+                    notice = edit_file(terminal, &entry.path.join(&conflict.path))?;
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Screen shown when no folders are joined yet. Returns true on quit.
+fn empty_screen(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<bool> {
+    terminal.draw(|frame| {
+        frame.render_widget(
+            Paragraph::new(
+                "No folders yet.\n\n\
+                 pando share <folder>   host a folder on this network\n\
+                 pando join <name>      bring a hosted folder to this device\n\n\
+                 q quit",
+            )
+            .block(Block::default().title(" PANDO ").borders(Borders::ALL)),
+            frame.area(),
+        );
+    })?;
+    if !event::poll(Duration::from_secs(1))? {
+        return Ok(false);
+    }
+    if let Event::Key(key) = event::read()? {
+        return Ok(matches!(key.code, KeyCode::Char('q') | KeyCode::Esc));
+    }
+    Ok(false)
 }
 
 fn workspace_body(

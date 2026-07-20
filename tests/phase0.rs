@@ -11,6 +11,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
 
 struct Harness {
@@ -966,38 +967,113 @@ fn receiver_two_snapshots_behind_sees_a_revert_to_the_git_base() {
     );
 }
 
-#[test]
-fn one_shot_cli_push_releases_its_lease() {
-    let root = tempfile::tempdir().unwrap();
-    let repo = root.path().join("repo");
-    let authority_path = root.path().join("authority");
-    fs::create_dir_all(&repo).unwrap();
-    fs::write(repo.join("work.txt"), "work\n").unwrap();
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn pando(data_home: &Path, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_pando"))
-        .env("PANDO_DATA_HOME", root.path().join("client-state"))
-        .args([
-            "push",
-            "--repo",
-            repo.to_str().unwrap(),
-            "--repo-id",
-            "repo",
-            "--trunk-id",
-            "one-shot",
-            "--authority",
-            authority_path.to_str().unwrap(),
-        ])
+        .env("PANDO_DATA_HOME", data_home)
+        .args(args)
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "pando {args:?} failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8(output.stdout).unwrap()
+}
 
-    let mut authority = FileAuthority::open(authority_path).unwrap();
+#[test]
+fn cli_onboarding_flows_from_up_to_a_joined_folder() {
+    let root = tempfile::tempdir().unwrap();
+    let host_home = root.path().join("host-state");
+    let guest_home = root.path().join("guest-state");
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let address = format!("127.0.0.1:{port}");
+
+    // First device creates the network, then runs the authority.
+    pando(
+        &host_home,
+        &["up", "--no-services", "--name", "macbook", "--bind", &address],
+    );
+    let _serve = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_DATA_HOME", &host_home)
+            .args(["serve", "--bind", &address])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    for attempt in 0.. {
+        match std::net::TcpStream::connect(&address) {
+            Ok(_) => break,
+            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("authority never came up: {error}"),
+        }
+    }
+
+    // Host shares a folder with real content.
+    let folder = root.path().join("code");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("work.txt"), "over the wire\n").unwrap();
+    pando(
+        &host_home,
+        &["share", folder.to_str().unwrap(), "--no-services"],
+    );
+
+    // Host mints an invite; second device enrolls with the printed code.
+    let invite = pando(&host_home, &["invite"]);
+    let code = invite
+        .split_whitespace()
+        .skip_while(|word| *word != "--code")
+        .nth(1)
+        .expect("invite output contains a code");
+    pando(
+        &guest_home,
+        &[
+            "up",
+            "--no-services",
+            "--name",
+            "linuxbox",
+            "--to",
+            &address,
+            "--code",
+            code,
+        ],
+    );
+    assert!(pando(&guest_home, &["devices"]).contains("macbook"));
+
+    // Guest joins the shared folder and gets the files.
+    let landing = root.path().join("guest-code");
+    pando(
+        &guest_home,
+        &["join", "code", landing.to_str().unwrap(), "--no-services"],
+    );
+    assert_eq!(
+        fs::read_to_string(landing.join("work.txt")).unwrap(),
+        "over the wire\n"
+    );
+
+    // A one-shot sync releases its lease so other devices can push next.
+    pando(&guest_home, &["sync"]);
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(guest_home.join("device.json")).unwrap()).unwrap();
+    let workspace_id = config["shares"][0]["workspaces"][0]["id"].as_str().unwrap();
+    let mut authority = FileAuthority::open(host_home.join("authority")).unwrap();
     assert!(matches!(
         authority
-            .acquire("repo", "other-trunk", SystemClock.now_ms(), 1_000)
+            .acquire(workspace_id, "probe", SystemClock.now_ms(), 1_000)
             .unwrap(),
         AcquireResult::Acquired(_)
     ));
@@ -1358,6 +1434,22 @@ fn authority_lease_generation_increases_on_takeover() {
     ) if second.generation > first.generation));
 }
 
+const TCP_DEVICE_ID: &str = "aabbccdd00112233aabbccdd00112233";
+
+fn tcp_registry(directory: &Path, device_key: &TransportKey) -> pando::registry::Registry {
+    pando::registry::Registry::create(
+        directory,
+        &pando::registry::random_hex(16).unwrap(),
+        "127.0.0.1:7337",
+        &TransportKey::from_bytes([9; 32]),
+        TCP_DEVICE_ID,
+        "macbook",
+        device_key,
+        1_000,
+    )
+    .unwrap()
+}
+
 #[test]
 fn tcp_authority_transports_a_snapshot() {
     let harness = Harness::plain();
@@ -1365,11 +1457,11 @@ fn tcp_authority_transports_a_snapshot() {
     let address = listener.local_addr().unwrap();
     let authority = harness.authority();
     let key = TransportKey::from_bytes([7; 32]);
-    let server_key = key.clone();
+    let registry = tcp_registry(harness._root.path(), &key);
     std::thread::spawn(move || {
-        pando::transport::serve_listener(listener, authority, server_key).unwrap()
+        pando::transport::serve_listener(listener, authority, registry).unwrap()
     });
-    let mut remote = RemoteAuthority::new(address.to_string(), key);
+    let mut remote = RemoteAuthority::new(address.to_string(), TCP_DEVICE_ID, key);
     fs::write(harness.first_path.join("network.txt"), "over tcp\n").unwrap();
 
     let first = harness.first();
@@ -1390,17 +1482,58 @@ fn tcp_authority_rejects_a_client_with_the_wrong_key() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let authority = harness.authority();
+    let registry = tcp_registry(harness._root.path(), &TransportKey::from_bytes([1; 32]));
     std::thread::spawn(move || {
-        pando::transport::serve_listener(listener, authority, TransportKey::from_bytes([1; 32]))
-            .unwrap()
+        pando::transport::serve_listener(listener, authority, registry).unwrap()
     });
-    let remote = RemoteAuthority::new(address.to_string(), TransportKey::from_bytes([2; 32]));
+    let remote = RemoteAuthority::new(
+        address.to_string(),
+        TCP_DEVICE_ID,
+        TransportKey::from_bytes([2; 32]),
+    );
 
     let error = remote.head("repo").unwrap_err();
     assert!(
         format!("{error:#}").contains("secure authority handshake"),
         "{error:#}"
     );
+}
+
+#[test]
+fn enrollment_code_admits_a_new_device_and_revocation_expels_it() {
+    let harness = Harness::plain();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let authority = harness.authority();
+    let host_key = TransportKey::from_bytes([7; 32]);
+    let registry = tcp_registry(harness._root.path(), &host_key);
+    std::thread::spawn(move || {
+        pando::transport::serve_listener(listener, authority, registry).unwrap()
+    });
+    let host = RemoteAuthority::new(address.clone(), TCP_DEVICE_ID, host_key);
+
+    // The host mints a code; a new device enrolls with it once.
+    let invite = host.invite().unwrap();
+    let grant = pando::transport::enroll(&address, &invite.code, "linuxbox").unwrap();
+    assert_ne!(grant.device_id, TCP_DEVICE_ID);
+    assert!(pando::transport::enroll(&address, &invite.code, "impostor").is_err());
+
+    // The minted credentials work for normal RPCs.
+    let joined = RemoteAuthority::new(
+        address.clone(),
+        grant.device_id.clone(),
+        TransportKey::from_hex(&grant.device_key).unwrap(),
+    );
+    assert_eq!(joined.devices().unwrap().len(), 2);
+
+    // A wrong code never yields credentials.
+    let second = host.invite().unwrap();
+    assert!(pando::transport::enroll(&address, "wrong-code99", "sneak").is_err());
+    assert_ne!(second.code, invite.code);
+
+    // Revocation deletes the device's key; its next call is refused.
+    host.revoke_device(&grant.device_id).unwrap();
+    assert!(joined.devices().is_err());
 }
 
 #[test]
