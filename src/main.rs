@@ -12,7 +12,7 @@ use pando::transport::{RemoteAuthority, TransportKey};
 use std::fs;
 use std::net::{IpAddr, UdpSocket};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(version, about = "Your working tree, on every device")]
@@ -701,8 +701,16 @@ fn join(name: &str, path: Option<PathBuf>, no_services: bool) -> Result<()> {
         let workspace_path = config.workspace_path(&local, workspace);
         fs::create_dir_all(&workspace_path)?;
         let trunk = Trunk::open(&workspace_path, &workspace.id, &config.device_id)?;
+        println!("{}/{}: syncing", name, workspace.name);
+        let started = Instant::now();
         let result = trunk.pull(&authority, &SystemClock)?;
-        println!("{}/{}: {}", name, workspace.name, describe_pull(&result));
+        println!(
+            "{}/{}: {} in {:.1}s",
+            name,
+            workspace.name,
+            describe_pull(&result),
+            started.elapsed().as_secs_f64()
+        );
     }
     config.upsert_share(local);
     pando::config::save(&config)?;
@@ -714,22 +722,41 @@ fn push_shares(
     authority: &mut dyn Authority,
     only: Option<&str>,
 ) -> Result<()> {
+    let mut failures = 0;
     for share in &config.shares {
         if only.is_some_and(|name| name != share.name) {
             continue;
         }
         for workspace in &share.workspaces {
             let path = config.workspace_path(share, workspace);
-            let trunk = Trunk::open(&path, &workspace.id, &config.device_id)?;
-            let result = trunk.push(authority, &SystemClock)?;
-            trunk.release(authority)?;
-            println!(
-                "{}/{}: {}",
-                share.name,
-                workspace.name,
-                describe_push(&result)
-            );
+            println!("{}/{}: syncing", share.name, workspace.name);
+            let started = Instant::now();
+            let outcome = Trunk::open(&path, &workspace.id, &config.device_id).and_then(|trunk| {
+                let result = trunk.push(authority, &SystemClock)?;
+                trunk.release(authority)?;
+                Ok(result)
+            });
+            let elapsed = started.elapsed().as_secs_f64();
+            match outcome {
+                Ok(result) => println!(
+                    "{}/{}: {} in {:.1}s",
+                    share.name,
+                    workspace.name,
+                    describe_push(&result),
+                    elapsed
+                ),
+                Err(error) => {
+                    failures += 1;
+                    eprintln!(
+                        "{}/{}: failed in {elapsed:.1}s: {error:#}",
+                        share.name, workspace.name
+                    );
+                }
+            }
         }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} workspace(s) failed to sync");
     }
     Ok(())
 }
