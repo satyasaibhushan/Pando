@@ -16,6 +16,7 @@ pub fn capture(
     parent: Option<String>,
     created_at_ms: u64,
     store: &ChunkStore,
+    previous: Option<&Manifest>,
 ) -> Result<Manifest> {
     let canonical_repo = repo
         .canonicalize()
@@ -29,6 +30,7 @@ pub fn capture(
         created_at_ms,
         store,
         classifier,
+        previous,
     )
 }
 
@@ -40,6 +42,7 @@ pub(crate) fn capture_with_policy(
     created_at_ms: u64,
     store: &ChunkStore,
     policy: ClassificationPolicy,
+    previous: Option<&Manifest>,
 ) -> Result<Manifest> {
     let canonical_repo = repo
         .canonicalize()
@@ -53,6 +56,7 @@ pub(crate) fn capture_with_policy(
         created_at_ms,
         store,
         classifier,
+        previous,
     )
 }
 
@@ -64,10 +68,12 @@ fn capture_with_classifier(
     created_at_ms: u64,
     store: &ChunkStore,
     classifier: Classifier,
+    previous: Option<&Manifest>,
 ) -> Result<Manifest> {
     // Git repositories travel with a thin object pack instead of the whole
-    // object database: receivers refetch remote-reachable history from the
-    // repository's own remotes.
+    // object database: remote-reachable history stays behind, and receivers
+    // fetch it from the repository's own remotes only when an operation
+    // actually needs it.
     let git_root = git::is_repository_root(canonical_repo);
     let mut files = BTreeMap::new();
     for item in WalkDir::new(canonical_repo)
@@ -117,11 +123,26 @@ fn capture_with_classifier(
         );
     }
 
-    if git_root {
-        files.extend(git::local_pack_entries(canonical_repo, store)?);
-    }
-
-    let base_commit = git::pushed_base(canonical_repo).unwrap_or(None);
+    let base_commit = if git_root {
+        match previous.filter(|previous| git_inputs(&previous.files) == git_inputs(&files)) {
+            Some(previous) => {
+                files.extend(
+                    previous
+                        .files
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(".git/objects/"))
+                        .map(|(path, entry)| (path.clone(), entry.clone())),
+                );
+                previous.base_commit.clone()
+            }
+            None => {
+                files.extend(git::local_pack_entries(canonical_repo, store)?);
+                git::pushed_base(canonical_repo).unwrap_or(None)
+            }
+        }
+    } else {
+        None
+    };
     let mut manifest = Manifest {
         id: String::new(),
         repo_id: repo_id.to_owned(),
@@ -135,6 +156,19 @@ fn capture_with_classifier(
     };
     manifest.id = manifest_id(&manifest)?;
     Ok(manifest)
+}
+
+/// The thin pack and the pushed base are pure functions of the repository's
+/// portable git state: every packed object is reachable from a ref, reflog
+/// entry, or the index, and all of those live in portable `.git` files. When
+/// none of them changed since the previous snapshot, its pack entries still
+/// hold — sparing both the repack and the need to have remote-reachable
+/// history present locally at all.
+fn git_inputs(files: &BTreeMap<String, FileEntry>) -> BTreeMap<&String, &FileEntry> {
+    files
+        .iter()
+        .filter(|(path, _)| path.starts_with(".git/") && !path.starts_with(".git/objects/"))
+        .collect()
 }
 
 pub fn overlay_against(repo: &Path, manifest: Manifest, store: &ChunkStore) -> Result<Overlay> {

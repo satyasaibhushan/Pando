@@ -176,6 +176,7 @@ impl Trunk {
                         version: policy.snapshot.classification_version,
                         patterns: policy.snapshot.ignore_patterns.clone(),
                     },
+                    base.as_ref().map(|overlay| &overlay.snapshot),
                 )?;
                 let empty = BTreeMap::new();
                 let base_files = base
@@ -201,10 +202,14 @@ impl Trunk {
                 let delta = materialization_delta(&self.repo, &target, &local.files)?;
                 self.ensure_materialization_chunks(authority, &target, &delta)?;
                 materialize_overlay(&self.repo, &delta, &self.chunks)?;
-                self.ensure_git_history(&target)?;
                 state.head = Some(authority_head);
                 self.save_state(&state)?;
             }
+            let previous = state
+                .head
+                .as_deref()
+                .map(|head| authority.overlay(head))
+                .transpose()?;
             let manifest = capture(
                 &self.repo,
                 &self.repo_id,
@@ -212,12 +217,8 @@ impl Trunk {
                 state.head.clone(),
                 now_ms,
                 &self.chunks,
+                previous.as_ref().map(|overlay| &overlay.snapshot),
             )?;
-            let previous = state
-                .head
-                .as_deref()
-                .map(|head| authority.overlay(head))
-                .transpose()?;
             if let Some(previous) = &previous
                 && previous.snapshot.files == manifest.files
                 && previous.snapshot.base_commit == manifest.base_commit
@@ -297,6 +298,7 @@ impl Trunk {
                 version: current_policy.0,
                 patterns: current_policy.1,
             },
+            previous.as_ref().map(|overlay| &overlay.snapshot),
         )?;
         if let Some(previous) = previous {
             if current.files != previous.snapshot.files {
@@ -324,7 +326,6 @@ impl Trunk {
         let delta = materialization_delta(&self.repo, &overlay, &current.files)?;
         let downloaded = self.ensure_materialization_chunks(authority, &overlay, &delta)?;
         materialize_overlay(&self.repo, &delta, &self.chunks)?;
-        self.ensure_git_history(&overlay)?;
         state.head = Some(authority_head.clone());
         self.save_state(&state)?;
         Ok(PullResult::Applied {
@@ -359,6 +360,11 @@ impl Trunk {
             .head(&self.repo_id)?
             .context("authority has no active head")?;
         let mut state = self.load_state()?;
+        let previous = state
+            .head
+            .as_deref()
+            .map(|head| authority.overlay(head))
+            .transpose()?;
         let current = capture_with_policy(
             &self.repo,
             &self.repo_id,
@@ -370,6 +376,7 @@ impl Trunk {
                 version: fork.snapshot.classification_version,
                 patterns: fork.snapshot.ignore_patterns.clone(),
             },
+            previous.as_ref().map(|overlay| &overlay.snapshot),
         )?;
         if choice != ReconcileChoice::Manual && current.files != fork.snapshot.files {
             anyhow::bail!(
@@ -488,17 +495,23 @@ impl Trunk {
             .head(&self.repo_id)?
             .context("authority has no active head")?;
         let current_head = authority.overlay(&head)?;
+        let state_head = self.load_state()?.head;
+        let previous = state_head
+            .as_deref()
+            .map(|head| authority.overlay(head))
+            .transpose()?;
         let current = capture_with_policy(
             &self.repo,
             &self.repo_id,
             &self.trunk_id,
-            self.load_state()?.head,
+            state_head,
             clock.now_ms(),
             &self.chunks,
             ClassificationPolicy {
                 version: fork.snapshot.classification_version,
                 patterns: fork.snapshot.ignore_patterns.clone(),
             },
+            previous.as_ref().map(|overlay| &overlay.snapshot),
         )?;
         if current.files != fork.snapshot.files {
             anyhow::bail!(
@@ -609,18 +622,6 @@ impl Trunk {
         let delta = materialization_delta(&self.repo, target, current)?;
         self.ensure_materialization_chunks(authority, target, &delta)?;
         materialize_overlay(&self.repo, &delta, &self.chunks)?;
-        self.ensure_git_history(target)
-    }
-
-    /// Snapshots ship git history as a thin local-only pack; after
-    /// materializing one, the remote-reachable objects must be fetched into
-    /// the repository so its refs resolve.
-    fn ensure_git_history(&self, target: &crate::model::Overlay) -> Result<()> {
-        if let Some(commit) = target.snapshot.base_commit.as_deref()
-            && crate::git::is_repository_root(&self.repo)
-        {
-            crate::git::ensure_commit(&self.repo, commit)?;
-        }
         Ok(())
     }
 
@@ -631,12 +632,20 @@ impl Trunk {
         delta: &crate::model::Overlay,
     ) -> Result<usize> {
         let mut downloaded = 0;
-        if delta
+        let mut missing: Vec<String> = delta
             .upserts
             .values()
-            .any(|entry| !self.chunks.contains(&entry.chunk))
-            && target.snapshot.base_commit.is_some()
-        {
+            .filter(|entry| !self.chunks.contains(&entry.chunk))
+            .map(|entry| entry.chunk.clone())
+            .collect();
+        missing.sort();
+        missing.dedup();
+        // The authority is the cheap source; only chunks it compacted away in
+        // favor of the git baseline are worth rebuilding from history.
+        let unavailable = authority.missing_chunks(&missing)?;
+        missing.retain(|hash| !unavailable.contains(hash));
+        downloaded += self.download_chunks(authority, missing)?;
+        if !unavailable.is_empty() && target.snapshot.base_commit.is_some() {
             let baseline: Vec<String> = target
                 .upserts
                 .iter()
@@ -649,13 +658,13 @@ impl Trunk {
             downloaded += self.download_chunks(authority, baseline)?;
             self.reconstruct_git_baseline(target)?;
         }
-        let missing: Vec<String> = delta
+        let remaining: Vec<String> = delta
             .upserts
             .values()
             .filter(|entry| !self.chunks.contains(&entry.chunk))
             .map(|entry| entry.chunk.clone())
             .collect();
-        downloaded += self.download_chunks(authority, missing)?;
+        downloaded += self.download_chunks(authority, remaining)?;
         Ok(downloaded)
     }
 

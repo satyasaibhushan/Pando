@@ -1649,7 +1649,7 @@ fn git_branch_stash_index_and_dirty_files_follow_the_user() {
 }
 
 #[test]
-fn git_history_travels_as_a_thin_pack_and_refetches_from_the_remote() {
+fn git_history_travels_as_a_thin_pack_and_stays_remote_until_needed() {
     let root = tempfile::tempdir().unwrap();
     let remote = root.path().join("remote.git");
     let macbook = root.path().join("macbook");
@@ -1719,11 +1719,62 @@ fn git_history_travels_as_a_thin_pack_and_refetches_from_the_remote() {
     .unwrap();
     second.pull(&authority, &clock).unwrap();
     assert_eq!(git_output(&linuxbox, &["rev-parse", "HEAD"]), local_commit);
-    assert!(git_output(&linuxbox, &["log", "--format=%s"]).contains("pushed history"));
     assert_eq!(
         fs::read_to_string(linuxbox.join("pushed.txt")).unwrap(),
         "pushed\n"
     );
+    // Joining keeps the remote configured but leaves its history behind:
+    // only the thin pack's local-only objects travel.
+    assert_eq!(
+        git_output(&linuxbox, &["remote", "get-url", "origin"]),
+        remote.to_str().unwrap()
+    );
+    let pushed_tip = git_output(&macbook, &["rev-parse", "origin/main"]);
+    let present = Command::new("git")
+        .arg("-C")
+        .arg(&linuxbox)
+        .args(["cat-file", "-e", &format!("{pushed_tip}^{{commit}}")])
+        .output()
+        .unwrap();
+    assert!(
+        !present.status.success(),
+        "joining must not download remote-reachable history"
+    );
+
+    // Without the remote history the receiver must still sync cleanly,
+    // reusing the head snapshot's pack instead of repacking.
+    clock.advance(1_000);
+    let quiet = second.push(&mut authority, &clock).unwrap();
+    assert!(
+        matches!(quiet, PushResult::NoChanges { .. }),
+        "an untouched receiver must stay in sync without history: {quiet:?}"
+    );
+    second.release(&mut authority).unwrap();
+
+    // The first real git change cannot reuse the pack; it forces the
+    // one-time lazy fetch of the remote-reachable boundary.
+    git(&linuxbox, &["config", "user.email", "receiver@example.test"]);
+    git(&linuxbox, &["config", "user.name", "Pando Receiver"]);
+    clock.advance(1_000);
+    let published = second.push(&mut authority, &clock).unwrap();
+    assert!(
+        matches!(published, PushResult::Published { .. }),
+        "a git state change must publish after the lazy fetch: {published:?}"
+    );
+    second.release(&mut authority).unwrap();
+    assert!(git_output(&linuxbox, &["log", "--format=%s"]).contains("pushed history"));
+
+    // With the history in place, ordinary git work flows through as usual.
+    fs::write(linuxbox.join("receiver.txt"), "receiver\n").unwrap();
+    git(&linuxbox, &["add", "receiver.txt"]);
+    git(&linuxbox, &["commit", "-m", "receiver commit"]);
+    clock.advance(1_000);
+    let committed = second.push(&mut authority, &clock).unwrap();
+    assert!(
+        matches!(committed, PushResult::Published { .. }),
+        "a receiver commit must publish: {committed:?}"
+    );
+    second.release(&mut authority).unwrap();
 
     fs::remove_dir_all(&remote).unwrap();
     let edgebox = root.path().join("edgebox");
@@ -1743,7 +1794,7 @@ fn git_history_travels_as_a_thin_pack_and_refetches_from_the_remote() {
 }
 
 #[test]
-fn baseline_reconstruction_borrows_local_objects_instead_of_fetching() {
+fn newer_snapshot_applies_offline_from_authority_chunks() {
     let root = tempfile::tempdir().unwrap();
     let remote = root.path().join("remote.git");
     let macbook = root.path().join("macbook");
@@ -1788,9 +1839,8 @@ fn baseline_reconstruction_borrows_local_objects_instead_of_fetching() {
     second.pull(&authority, &clock).unwrap();
 
     // A new snapshot with the same base commit arrives while the remote is
-    // unreachable. Applying it needs the git baseline, and the baseline
-    // reconstruction must borrow objects from the repository next door
-    // instead of fetching.
+    // unreachable. Every chunk it needs is on the authority, so applying it
+    // must not touch git history or the network.
     fs::write(macbook.join("pushed.txt"), "updated\n").unwrap();
     clock.advance(1_000);
     first.push(&mut authority, &clock).unwrap();

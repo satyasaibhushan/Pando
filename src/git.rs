@@ -173,7 +173,16 @@ pub fn local_pack_entries(repo: &Path, store: &ChunkStore) -> Result<BTreeMap<St
             .to_string()[..12]
     ));
     std::fs::create_dir_all(&staging)?;
-    let result = pack_local_objects(repo, &staging, store);
+    let result = pack_local_objects(repo, &staging, store).or_else(|_| {
+        // The object walk must be able to read the remote-reachable boundary
+        // commits even though none of them land in the pack. A repository
+        // materialized from a snapshot lacks them until its first real git
+        // change forces this one-time fetch.
+        fetch_all_remote_objects(repo)?;
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)?;
+        pack_local_objects(repo, &staging, store)
+    });
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
