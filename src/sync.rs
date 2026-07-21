@@ -397,6 +397,25 @@ impl Trunk {
             });
         }
 
+        // Ship the snapshot's chunks before taking the write lease: on a slow
+        // link the upload alone can outlast the lease, and publishing must
+        // happen while it is still fresh.
+        let mut manifest = if choice == ReconcileChoice::Fork {
+            fork.snapshot.clone()
+        } else {
+            current.clone()
+        };
+        manifest.id.clear();
+        manifest.trunk_id = self.trunk_id.clone();
+        manifest.created_at_ms = clock.now_ms();
+        manifest.parent = Some(authority_head.clone());
+        manifest.id = manifest_id(&manifest)?;
+        let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
+        for entry in overlay.upserts.values() {
+            if !authority.has_chunk(&entry.chunk)? {
+                authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+            }
+        }
         match authority.acquire(
             &self.repo_id,
             &self.trunk_id,
@@ -411,22 +430,6 @@ impl Trunk {
         let result = (|| -> Result<ReconcileResult> {
             if authority.head(&self.repo_id)?.as_deref() != Some(&authority_head) {
                 anyhow::bail!("authority head changed during reconciliation");
-            }
-            let mut manifest = if choice == ReconcileChoice::Fork {
-                fork.snapshot.clone()
-            } else {
-                current.clone()
-            };
-            manifest.id.clear();
-            manifest.trunk_id = self.trunk_id.clone();
-            manifest.created_at_ms = clock.now_ms();
-            manifest.parent = Some(authority_head);
-            manifest.id = manifest_id(&manifest)?;
-            let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
-            for entry in overlay.upserts.values() {
-                if !authority.has_chunk(&entry.chunk)? {
-                    authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
-                }
             }
             authority.publish(&overlay, &self.trunk_id, clock.now_ms())?;
             if choice == ReconcileChoice::Fork {
