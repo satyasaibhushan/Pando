@@ -737,6 +737,9 @@ impl Trunk {
                 deletes: Vec::new(),
             };
             materialize_overlay(&repo, &git_overlay, &self.chunks)?;
+            // The thin pack omits remote-reachable objects on purpose; the
+            // real repository next door already has them.
+            crate::git::borrow_objects(&repo, &self.repo)?;
             crate::git::baseline(&repo, commit, &self.chunks)?;
             Result::<()>::Ok(())
         })();

@@ -1743,6 +1743,113 @@ fn git_history_travels_as_a_thin_pack_and_refetches_from_the_remote() {
 }
 
 #[test]
+fn baseline_reconstruction_borrows_local_objects_instead_of_fetching() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("remote.git");
+    let macbook = root.path().join("macbook");
+    let linuxbox = root.path().join("linuxbox");
+    git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(
+        root.path(),
+        &["init", "-b", "main", macbook.to_str().unwrap()],
+    );
+    git(&macbook, &["config", "user.email", "pando@example.test"]);
+    git(&macbook, &["config", "user.name", "Pando Test"]);
+    fs::write(macbook.join("pushed.txt"), "pushed\n").unwrap();
+    git(&macbook, &["add", "pushed.txt"]);
+    git(&macbook, &["commit", "-m", "pushed history"]);
+    git(
+        &macbook,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&macbook, &["push", "-u", "origin", "main"]);
+
+    let mut authority = FileAuthority::open(root.path().join("authority")).unwrap();
+    let clock = VirtualClock::at(42_000);
+    let first = Trunk::open_with_state(
+        &macbook,
+        "git-repo",
+        "macbook",
+        root.path().join("trunks/macbook"),
+    )
+    .unwrap();
+    first.push(&mut authority, &clock).unwrap();
+    first.release(&mut authority).unwrap();
+
+    fs::create_dir_all(&linuxbox).unwrap();
+    let second = Trunk::open_with_state(
+        &linuxbox,
+        "git-repo",
+        "linuxbox",
+        root.path().join("trunks/linuxbox"),
+    )
+    .unwrap();
+    second.pull(&authority, &clock).unwrap();
+
+    // A new snapshot with the same base commit arrives while the remote is
+    // unreachable. Applying it needs the git baseline, and the baseline
+    // reconstruction must borrow objects from the repository next door
+    // instead of fetching.
+    fs::write(macbook.join("pushed.txt"), "updated\n").unwrap();
+    clock.advance(1_000);
+    first.push(&mut authority, &clock).unwrap();
+    first.release(&mut authority).unwrap();
+    fs::remove_dir_all(&remote).unwrap();
+
+    clock.advance(1_000);
+    let result = second.pull(&authority, &clock).unwrap();
+    assert!(
+        matches!(result, PullResult::Applied { .. }),
+        "offline update must apply via borrowed objects: {result:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(linuxbox.join("pushed.txt")).unwrap(),
+        "updated\n"
+    );
+}
+
+#[test]
+fn missing_history_is_refetched_even_when_a_direct_fetch_cannot_supply_it() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("remote.git");
+    let seed = root.path().join("seed");
+    let clone = root.path().join("clone");
+    git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(root.path(), &["init", "-b", "main", seed.to_str().unwrap()]);
+    git(&seed, &["config", "user.email", "pando@example.test"]);
+    git(&seed, &["config", "user.name", "Pando Test"]);
+    fs::write(seed.join("work.txt"), "one\n").unwrap();
+    git(&seed, &["add", "work.txt"]);
+    git(&seed, &["commit", "-m", "one"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&seed, &["push", "-u", "origin", "main"]);
+    git(
+        root.path(),
+        &["clone", remote.to_str().unwrap(), clone.to_str().unwrap()],
+    );
+    let head = git_output(&clone, &["rev-parse", "HEAD"]);
+
+    // Wipe the object database while every ref keeps pointing into it — the
+    // state a materialized repository is in before its history arrives — and
+    // cripple the configured refspec so a direct fetch transfers nothing.
+    git(
+        &clone,
+        &["config", "remote.origin.fetch", "+refs/none/*:refs/none/*"],
+    );
+    fs::remove_dir_all(clone.join(".git/objects")).unwrap();
+    fs::create_dir_all(clone.join(".git/objects/pack")).unwrap();
+
+    pando::git::ensure_commit(&clone, &head).unwrap();
+    git(&clone, &["cat-file", "-e", &format!("{head}^{{commit}}")]);
+    assert!(git_output(&clone, &["log", "--format=%s"]).contains("one"));
+}
+
+#[test]
 fn fetch_reports_fast_forward_and_forced_remote_movement() {
     let root = tempfile::tempdir().unwrap();
     let remote = root.path().join("remote.git");

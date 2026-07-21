@@ -252,11 +252,105 @@ pub fn ensure_commit(repo: &Path, commit: &str) -> Result<()> {
     if commit_present(repo, commit) {
         return Ok(());
     }
-    fetch_remotes(repo).with_context(|| format!("fetch history for missing commit {commit}"))?;
+    // Never fetch directly into the repository here: a snapshot-materialized
+    // repository has refs pointing at objects the thin pack deliberately
+    // omits, which poisons the negotiation, and a direct fetch also writes
+    // ref and reflog files the snapshot never carried, leaving the tree
+    // spuriously diverged from its own head. The clean room only adds
+    // objects, never touching a ref.
+    let outcome = fetch_all_remote_objects(repo);
     if commit_present(repo, commit) {
         return Ok(());
     }
+    outcome.with_context(|| format!("fetch history for missing commit {commit}"))?;
     bail!("commit {commit} is not available locally or from any git remote");
+}
+
+/// Fetch every branch and tag from each remote through a fresh ref-less
+/// repository, then hand the objects over. The clean-room negotiation never
+/// claims to own objects the repository cannot actually read.
+fn fetch_all_remote_objects(repo: &Path) -> Result<()> {
+    let remotes = String::from_utf8(git(repo, &["remote"])?)?;
+    let staging = std::env::temp_dir().join(format!(
+        "pando-fetch-{}-{}",
+        std::process::id(),
+        &blake3::hash(repo.to_string_lossy().as_bytes())
+            .to_hex()
+            .to_string()[..12]
+    ));
+    let result = (|| {
+        let mut failure = None;
+        for remote in remotes
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let attempt = (|| {
+                let url = String::from_utf8(git(repo, &["remote", "get-url", remote])?)?
+                    .trim()
+                    .to_owned();
+                let clean_room = staging.join(remote);
+                std::fs::create_dir_all(&clean_room)?;
+                git(&clean_room, &["init", "--quiet", "--bare"])?;
+                let fetched = Command::new("git")
+                    .arg("-C")
+                    .arg(&clean_room)
+                    .args([
+                        "fetch",
+                        "--quiet",
+                        &url,
+                        "+refs/heads/*:refs/heads/*",
+                        "+refs/tags/*:refs/tags/*",
+                    ])
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .output()
+                    .context("run git fetch")?;
+                if !fetched.status.success() {
+                    bail!(
+                        "git fetch {remote} failed: {}",
+                        String::from_utf8_lossy(&fetched.stderr).trim()
+                    );
+                }
+                copy_objects(&clean_room.join("objects"), &repo.join(".git/objects"))
+            })();
+            if let Err(error) = attempt {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn copy_objects(source: &Path, destination: &Path) -> Result<()> {
+    for item in std::fs::read_dir(source)? {
+        let item = item?;
+        let target = destination.join(item.file_name());
+        if item.file_type()?.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_objects(&item.path(), &target)?;
+        } else if !target.exists() {
+            std::fs::copy(item.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Let `repo` resolve objects it does not hold from `source`'s object store,
+/// via git's alternates mechanism.
+pub fn borrow_objects(repo: &Path, source: &Path) -> Result<()> {
+    let objects = source.join(".git/objects");
+    if !objects.is_dir() {
+        return Ok(());
+    }
+    let info = repo.join(".git/objects/info");
+    std::fs::create_dir_all(&info)?;
+    std::fs::write(info.join("alternates"), format!("{}\n", objects.display()))?;
+    Ok(())
 }
 
 fn commit_present(repo: &Path, commit: &str) -> bool {
