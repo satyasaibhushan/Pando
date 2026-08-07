@@ -269,6 +269,10 @@ enum Request {
         repo_id: String,
         now_ms: u64,
     },
+    Statuses {
+        repo_ids: Vec<String>,
+        now_ms: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -300,6 +304,7 @@ enum Response {
     Forks(Vec<SnapshotId>),
     Status(AuthorityStatus),
     Error(String),
+    Statuses(Vec<AuthorityStatus>),
 }
 
 /// A freshly minted enrollment code plus where to point the new device.
@@ -485,7 +490,11 @@ fn open_stream(address: &str) -> Result<TcpStream> {
         .to_socket_addrs()
         .with_context(|| format!("resolve authority {address}"))?;
     let stream = connect_any(addresses, std::time::Duration::from_secs(5))
-        .with_context(|| format!("connect to authority {address}"))?;
+        .with_context(|| {
+            format!(
+                "connect to authority {address}; check that its host is online, Pando is running, and the private network or VPN is connected"
+            )
+        })?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     stream.set_write_timeout(Some(Duration::from_secs(120)))?;
     Ok(stream)
@@ -697,6 +706,19 @@ impl Authority for RemoteAuthority {
         })? {
             Response::Status(status) => Ok(status),
             _ => bail!("unexpected status response"),
+        }
+    }
+
+    fn statuses(&self, repo_ids: &[String], now_ms: u64) -> Result<Vec<AuthorityStatus>> {
+        match self.rpc(Request::Statuses {
+            repo_ids: repo_ids.to_vec(),
+            now_ms,
+        }) {
+            Ok(Response::Statuses(statuses)) => Ok(statuses),
+            Ok(_) | Err(_) => repo_ids
+                .iter()
+                .map(|repo_id| self.status(repo_id, now_ms))
+                .collect(),
         }
     }
 }
@@ -998,6 +1020,9 @@ fn dispatch(
             Request::Status { repo_id, now_ms } => {
                 Response::Status(authority.status(&repo_id, now_ms)?)
             }
+            Request::Statuses { repo_ids, now_ms } => {
+                Response::Statuses(authority.statuses(&repo_ids, now_ms)?)
+            }
             _ => bail!("request was already handled"),
         })
     })();
@@ -1143,10 +1168,10 @@ fn read_noise_record<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NOISE_CIPHERTEXT_BYTES, NOISE_PATTERN, NOISE_PROLOGUE, Request, TransportKey,
-        connect_any, handle_connection, read_secure_message, write_secure_message,
+        MAX_NOISE_CIPHERTEXT_BYTES, NOISE_PATTERN, NOISE_PROLOGUE, RemoteAuthority, Request,
+        TransportKey, connect_any, handle_connection, read_secure_message, write_secure_message,
     };
-    use crate::authority::FileAuthority;
+    use crate::authority::{Authority, FileAuthority};
     use crate::registry::{Registry, random_hex};
     use std::io::{Cursor, ErrorKind, Read, Write};
     use std::net::{Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -1179,6 +1204,51 @@ mod tests {
         assert!(!wire.windows(marker.len()).any(|window| window == marker));
         let decoded: Vec<u8> = read_secure_message(&mut Cursor::new(wire), &mut responder).unwrap();
         assert_eq!(decoded, secret);
+    }
+
+    #[test]
+    fn status_batch_round_trips_in_requested_order() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let device_id = "aabbccdd00112233aabbccdd00112233";
+        let device_key = TransportKey::from_bytes([3; 32]);
+        let authority = Arc::new(Mutex::new(
+            FileAuthority::open(root.path().join("authority")).unwrap(),
+        ));
+        let registry = Arc::new(Mutex::new(
+            Registry::create(
+                root.path(),
+                &random_hex(16).unwrap(),
+                "192.0.2.1:7337",
+                &TransportKey::from_bytes([7; 32]),
+                device_id,
+                "devbox",
+                &device_key,
+                1_000,
+            )
+            .unwrap(),
+        ));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = handle_connection(stream, &authority, &registry);
+        });
+        let remote = RemoteAuthority::new(address.to_string(), device_id, device_key);
+
+        let statuses = remote
+            .statuses(&["second".into(), "first".into()], 2_000)
+            .unwrap();
+
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|status| status.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        assert!(statuses.iter().all(|status| status.head.is_none()));
+        drop(remote);
+        server.join().unwrap();
     }
 
     #[test]
@@ -1237,7 +1307,12 @@ mod tests {
             .write_all(&(request.len() as u64).to_be_bytes())
             .unwrap();
         client.write_all(&request).unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
+        if let Err(error) = client.shutdown(Shutdown::Write) {
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::NotConnected | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+            ));
+        }
         let mut response = Vec::new();
         if let Err(error) = client.read_to_end(&mut response) {
             assert_eq!(error.kind(), ErrorKind::ConnectionReset);

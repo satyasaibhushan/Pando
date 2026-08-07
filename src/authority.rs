@@ -98,6 +98,12 @@ pub trait Authority {
     fn head(&self, repo_id: &str) -> Result<Option<SnapshotId>>;
     fn overlay(&self, snapshot_id: &str) -> Result<Overlay>;
     fn status(&self, repo_id: &str, now_ms: u64) -> Result<AuthorityStatus>;
+    fn statuses(&self, repo_ids: &[String], now_ms: u64) -> Result<Vec<AuthorityStatus>> {
+        repo_ids
+            .iter()
+            .map(|repo_id| self.status(repo_id, now_ms))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -664,22 +670,33 @@ impl Authority for FileAuthority {
     }
 
     fn status(&self, repo_id: &str, now_ms: u64) -> Result<AuthorityStatus> {
+        self.statuses(&[repo_id.to_owned()], now_ms)?
+            .pop()
+            .context("authority returned no status")
+    }
+
+    fn statuses(&self, repo_ids: &[String], now_ms: u64) -> Result<Vec<AuthorityStatus>> {
         let state = self.load_state()?;
-        let lease = state
-            .leases
-            .get(repo_id)
-            .filter(|lease| lease.expires_at_ms > now_ms)
-            .cloned();
-        let head = state.heads.get(repo_id).cloned();
-        let overlay = head.as_deref().map(|id| self.overlay(id)).transpose()?;
-        Ok(AuthorityStatus {
-            repo_id: repo_id.to_owned(),
-            lease,
-            head,
-            last_snapshot_at_ms: overlay.as_ref().map(|value| value.snapshot.created_at_ms),
-            exposure_bytes: overlay.as_ref().map(Overlay::bytes).unwrap_or(0),
-            forks: state.forks.get(repo_id).cloned().unwrap_or_default(),
-        })
+        repo_ids
+            .iter()
+            .map(|repo_id| {
+                let lease = state
+                    .leases
+                    .get(repo_id)
+                    .filter(|lease| lease.expires_at_ms > now_ms)
+                    .cloned();
+                let head = state.heads.get(repo_id).cloned();
+                let overlay = head.as_deref().map(|id| self.overlay(id)).transpose()?;
+                Ok(AuthorityStatus {
+                    repo_id: repo_id.clone(),
+                    lease,
+                    head,
+                    last_snapshot_at_ms: overlay.as_ref().map(|value| value.snapshot.created_at_ms),
+                    exposure_bytes: overlay.as_ref().map(Overlay::bytes).unwrap_or(0),
+                    forks: state.forks.get(repo_id).cloned().unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 }
 

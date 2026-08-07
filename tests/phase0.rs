@@ -3,6 +3,7 @@ use pando::authority::{AcquireResult, Authority, FileAuthority};
 use pando::clock::{SystemClock, VirtualClock};
 use pando::model::{FileEntry, FileKind, Manifest, Overlay};
 use pando::snapshot::manifest_id;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use pando::store::ChunkStore;
 use pando::sync::{PullResult, PushResult, Trunk};
 use pando::transport::{RemoteAuthority, TransportKey};
@@ -1753,7 +1754,10 @@ fn git_history_travels_as_a_thin_pack_and_stays_remote_until_needed() {
 
     // The first real git change cannot reuse the pack; it forces the
     // one-time lazy fetch of the remote-reachable boundary.
-    git(&linuxbox, &["config", "user.email", "receiver@example.test"]);
+    git(
+        &linuxbox,
+        &["config", "user.email", "receiver@example.test"],
+    );
     git(&linuxbox, &["config", "user.name", "Pando Receiver"]);
     clock.advance(1_000);
     let published = second.push(&mut authority, &clock).unwrap();
