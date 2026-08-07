@@ -1631,8 +1631,15 @@ fn git_branch_stash_index_and_dirty_files_follow_the_user() {
     )
     .unwrap();
     first.push(&mut authority, &clock).unwrap();
+    let snapshot = authority
+        .overlay(&authority.head("git-repo").unwrap().unwrap())
+        .unwrap();
+    assert!(snapshot.snapshot.files.contains_key(".git/refs/stash"));
+    assert!(snapshot.snapshot.files.contains_key(".git/logs/refs/stash"));
     first.release(&mut authority).unwrap();
     second.pull(&authority, &clock).unwrap();
+    assert!(linuxbox.join(".git/refs/stash").is_file());
+    assert!(linuxbox.join(".git/logs/refs/stash").is_file());
 
     assert_eq!(
         fs::read_to_string(linuxbox.join("tracked.txt")).unwrap(),

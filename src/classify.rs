@@ -18,12 +18,14 @@ const BUILTIN_IGNORES: &[&str] = &[
     ".next/",
     ".turbo/",
     ".parcel-cache/",
+    ".build/",
     "*.pyc",
     "*.pyo",
+    "*.tsbuildinfo",
     ".DS_Store",
     "Thumbs.db",
 ];
-pub const CURRENT_CLASSIFICATION_VERSION: u32 = 1;
+pub const CURRENT_CLASSIFICATION_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClassificationPolicy {
@@ -112,6 +114,9 @@ impl Classifier {
         if first == Some(Component::Normal(".pando".as_ref())) {
             return false;
         }
+        if self.version >= 2 && is_local_git_metadata(relative) {
+            return false;
+        }
         if first == Some(Component::Normal(".git".as_ref()))
             || relative == Path::new(".pandoignore")
         {
@@ -129,6 +134,12 @@ impl Classifier {
             return Classification {
                 portable: false,
                 reason: "reserved root .pando/ is always local".into(),
+            };
+        }
+        if self.version >= 2 && is_local_git_metadata(relative) {
+            return Classification {
+                portable: false,
+                reason: "regenerable machine-local Git bookkeeping".into(),
             };
         }
         if first == Some(Component::Normal(".git".as_ref()))
@@ -160,6 +171,25 @@ impl Classifier {
             },
         }
     }
+}
+
+fn is_local_git_metadata(relative: &Path) -> bool {
+    let Some(git_relative) = relative.strip_prefix(".git").ok() else {
+        return false;
+    };
+    git_relative == Path::new(".DS_Store")
+        || git_relative == Path::new("FETCH_HEAD")
+        || git_relative == Path::new("ORIG_HEAD")
+        || git_relative == Path::new("COMMIT_EDITMSG")
+        || (git_relative.starts_with("logs/")
+            && git_relative != Path::new("logs")
+            && git_relative != Path::new("logs/refs")
+            && git_relative != Path::new("logs/refs/stash"))
+        || git_relative == Path::new("worktrees")
+        || git_relative.starts_with("worktrees/")
+        || git_relative
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".lock"))
 }
 
 pub fn global_rules_path() -> Result<PathBuf> {
@@ -249,6 +279,43 @@ mod tests {
             "portable by default"
         );
         assert!(classifier.explain(Path::new(".git/index"), false).portable);
+        assert!(
+            classifier
+                .explain(Path::new(".git/refs/heads/main"), false)
+                .portable
+        );
+        assert!(
+            classifier
+                .explain(Path::new(".git/refs/stash"), false)
+                .portable
+        );
+        for path in [
+            ".git/.DS_Store",
+            ".git/FETCH_HEAD",
+            ".git/ORIG_HEAD",
+            ".git/COMMIT_EDITMSG",
+            ".git/logs/HEAD",
+            ".git/worktrees/feature/gitdir",
+            ".git/index.lock",
+        ] {
+            let classification = classifier.explain(Path::new(path), false);
+            assert!(!classification.portable, "{path}");
+            assert!(classification.reason.contains("Git bookkeeping"));
+        }
+        let legacy = Classifier::from_policy(root.path(), 1, Vec::new()).unwrap();
+        assert!(legacy.is_portable(Path::new(".git/FETCH_HEAD"), false));
+        assert!(classifier.is_portable(Path::new(".git/logs/refs/stash"), false));
+        assert!(classifier.is_portable(Path::new(".git/refs/remotes/origin/main"), false));
+        assert!(
+            !classifier
+                .explain(Path::new("apps/apple/.build/debug/app"), false)
+                .portable
+        );
+        assert!(
+            !classifier
+                .explain(Path::new("packages/core/tsconfig.tsbuildinfo"), false)
+                .portable
+        );
         assert!(
             !classifier
                 .explain(Path::new(".pando/state"), false)

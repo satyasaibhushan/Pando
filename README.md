@@ -67,11 +67,11 @@ The lower-level `serve`, `watch`, `reconcile`, `verify`, `gc`, and `restore` com
 
 Pando syncs portable working state by default, including Git-ignored secrets such as `.env`. It excludes conservative built-in derived and machine-local paths:
 
-- Rust `target/` at the repository root.
+- Rust `target/` at the repository root, SwiftPM `.build/`, and TypeScript incremental build metadata.
 - `node_modules/`, Python virtual environments and caches, Gradle/Next/Turbo/Parcel caches.
 - Python bytecode, `.DS_Store`, `Thumbs.db`, sockets, and other special files.
 
-Add repository-specific rules to `.pandoignore` using Git-ignore syntax. User-wide rules use the same syntax in `~/.config/pando/ignore` (or `$PANDO_CONFIG_HOME/ignore`; `$XDG_CONFIG_HOME/pando/ignore` is also honored). Precedence is built-ins, then user-wide rules, then repository rules, so the repository can make the final override. The flattened policy is stored in each snapshot so receivers materialize it consistently. For example, `!/target/` explicitly makes the root `target/` portable. `.git/` and `.pandoignore` itself always remain portable, while the root `.pando/` directory always remains local.
+Add repository-specific rules to `.pandoignore` using Git-ignore syntax. User-wide rules use the same syntax in `~/.config/pando/ignore` (or `$PANDO_CONFIG_HOME/ignore`; `$XDG_CONFIG_HOME/pando/ignore` is also honored). Precedence is built-ins, then user-wide rules, then repository rules, so the repository can make the final override. The flattened policy is stored in each snapshot so receivers materialize it consistently. For example, `!/target/` explicitly makes the root `target/` portable. Portable `.git/` state includes the index, HEAD, local and remote-tracking branches, tags, stash, hooks, and in-progress operation markers. Regenerable machine-local Git bookkeeping—reflogs other than the stash log, `FETCH_HEAD`, `ORIG_HEAD`, `COMMIT_EDITMSG`, lock files, worktree registrations, and `.DS_Store`—stays local and never creates a cross-device conflict. `.pandoignore` itself always remains portable, while the root `.pando/` directory always remains local.
 
 Pando intentionally does not inherit `.gitignore`: Git-ignored files are often exactly the uncommitted state Pando exists to carry. Use `.pandoignore` for additional derived or local-only paths.
 
@@ -151,7 +151,7 @@ pando verify --data ~/.local/share/pando/authority
 
 The audit rehashes every stored chunk, recomputes every snapshot ID, validates overlay shape and byte lengths, walks parent chains, and checks that every repository head resolves to a snapshot for that repository. For the cleanest point-in-time result, run it while the authority is idle; a concurrent publication can produce a transient mismatch that is safe to retry.
 
-Preview storage reclamation with `pando gc --data ~/.local/share/pando/authority`. Pando retains overlay upserts plus complete `.git` state; files already absorbed by a pushed base are reconstructed from that pinned Git commit during pull, authority restore, and encrypted escape recovery. GC can therefore discard absorbed base-file chunks as well as snapshots unreachable from every head or pending fork and chunks used only by those snapshots. It verifies before reporting. Stop the authority service and pass `--apply` to delete exactly that collectable set; retained head/fork ancestry remains restorable and is verified again afterward.
+Preview storage reclamation with `pando gc --data ~/.local/share/pando/authority`. Pando retains overlay upserts plus portable `.git` state; files already absorbed by a pushed base are reconstructed from that pinned Git commit during pull, authority restore, and encrypted escape recovery. GC can therefore discard absorbed base-file chunks as well as snapshots unreachable from every head or pending fork and chunks used only by those snapshots. It verifies before reporting. Stop the authority service and pass `--apply` to delete exactly that collectable set; retained head/fork ancestry remains restorable and is verified again afterward.
 
 Restore any retained snapshot into a new path:
 
