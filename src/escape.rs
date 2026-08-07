@@ -15,8 +15,11 @@ use std::process::{Command, Stdio};
 
 const FORMAT_VERSION: u32 = 1;
 const MAGIC: &[u8] = b"PANDO-ESCAPE-V1\0";
+const PARTS_MAGIC: &[u8] = b"PANDO-ESCAPE-PARTS-V1\0";
 const KEY_CONTEXT: &str = "pando escape bundle encryption v1";
 const BUNDLE_PATH: &str = "snapshot.pando";
+const MAX_BLOB_BYTES: usize = 90 * 1024 * 1024;
+const MAX_PARTS: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportReport {
@@ -40,6 +43,13 @@ struct Bundle {
     version: u32,
     overlay: Overlay,
     chunks: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PartsManifest {
+    bytes: u64,
+    digest: String,
+    parts: u32,
 }
 
 pub fn reference(repo_id: &str, trunk_id: &str) -> String {
@@ -240,7 +250,7 @@ pub fn restore(
     destination: &Path,
 ) -> Result<EscapeRestoreReport> {
     ensure_repository_root(repo)?;
-    let encrypted = git(repo, &["show", &format!("{reference}:{BUNDLE_PATH}")])?;
+    let encrypted = read_encrypted(repo, reference)?;
     let plaintext = decrypt(&encrypted, key)?;
     let (bundle, consumed): (Bundle, usize) =
         bincode::serde::decode_from_slice(&plaintext, bincode::config::standard())?;
@@ -386,14 +396,89 @@ fn restore_bundle(bundle: Bundle, destination: &Path) -> Result<EscapeRestoreRep
     result
 }
 
+fn read_encrypted(repo: &Path, reference: &str) -> Result<Vec<u8>> {
+    let manifest = git(repo, &["show", &format!("{reference}:{BUNDLE_PATH}")])?;
+    if manifest.starts_with(MAGIC) {
+        return Ok(manifest);
+    }
+    if !manifest.starts_with(PARTS_MAGIC) {
+        bail!("not a Pando escape bundle");
+    }
+    let encoded = &manifest[PARTS_MAGIC.len()..];
+    let (parts, consumed): (PartsManifest, usize) =
+        bincode::serde::decode_from_slice(encoded, bincode::config::standard())?;
+    if consumed != encoded.len() {
+        bail!("escape parts manifest has trailing data");
+    }
+    let part_count = usize::try_from(parts.parts)?;
+    if part_count == 0 || part_count > MAX_PARTS {
+        bail!("escape parts manifest has invalid part count {part_count}");
+    }
+    let expected_bytes = usize::try_from(parts.bytes)?;
+    let mut encrypted = Vec::new();
+    for index in 0..part_count {
+        let part = git(
+            repo,
+            &["show", &format!("{reference}:{}", part_path(index))],
+        )?;
+        if encrypted.len().saturating_add(part.len()) > expected_bytes {
+            bail!("escape parts exceed their declared size");
+        }
+        encrypted.extend_from_slice(&part);
+    }
+    if encrypted.len() != expected_bytes {
+        bail!(
+            "escape parts contain {} bytes, expected {expected_bytes}",
+            encrypted.len()
+        );
+    }
+    if blake3::hash(&encrypted).to_hex().as_str() != parts.digest {
+        bail!("escape parts failed verification");
+    }
+    Ok(encrypted)
+}
+
 fn write_ref(repo: &Path, reference: &str, snapshot: &str, encrypted: &[u8]) -> Result<()> {
-    let blob = String::from_utf8(git_with_input(
-        repo,
-        &["hash-object", "-w", "--stdin"],
-        encrypted,
-        &[],
-    )?)?;
-    let tree_input = format!("100644 blob {}\t{BUNDLE_PATH}\n", blob.trim());
+    write_ref_with_max_blob_bytes(repo, reference, snapshot, encrypted, MAX_BLOB_BYTES)
+}
+
+fn write_ref_with_max_blob_bytes(
+    repo: &Path,
+    reference: &str,
+    snapshot: &str,
+    encrypted: &[u8],
+    max_blob_bytes: usize,
+) -> Result<()> {
+    if max_blob_bytes == 0 {
+        bail!("escape blob size must be greater than zero");
+    }
+    let mut tree_entries = Vec::new();
+    if encrypted.len() <= max_blob_bytes {
+        tree_entries.push((BUNDLE_PATH.to_owned(), write_blob(repo, encrypted)?));
+    } else {
+        let part_count = encrypted.len().div_ceil(max_blob_bytes);
+        if part_count > MAX_PARTS {
+            bail!("escape bundle requires too many parts ({part_count})");
+        }
+        let parts = PartsManifest {
+            bytes: u64::try_from(encrypted.len())?,
+            digest: blake3::hash(encrypted).to_hex().to_string(),
+            parts: u32::try_from(part_count)?,
+        };
+        let mut manifest = PARTS_MAGIC.to_vec();
+        manifest.extend(bincode::serde::encode_to_vec(
+            &parts,
+            bincode::config::standard(),
+        )?);
+        tree_entries.push((BUNDLE_PATH.to_owned(), write_blob(repo, &manifest)?));
+        for (index, part) in encrypted.chunks(max_blob_bytes).enumerate() {
+            tree_entries.push((part_path(index), write_blob(repo, part)?));
+        }
+    }
+    let tree_input = tree_entries
+        .iter()
+        .map(|(path, blob)| format!("100644 blob {blob}\t{path}\n"))
+        .collect::<String>();
     let tree = String::from_utf8(git_with_input(
         repo,
         &["mktree"],
@@ -422,6 +507,20 @@ fn write_ref(repo: &Path, reference: &str, snapshot: &str, encrypted: &[u8]) -> 
     )?)?;
     git(repo, &["update-ref", reference, commit.trim()])?;
     Ok(())
+}
+
+fn write_blob(repo: &Path, bytes: &[u8]) -> Result<String> {
+    let blob = String::from_utf8(git_with_input(
+        repo,
+        &["hash-object", "-w", "--stdin"],
+        bytes,
+        &[],
+    )?)?;
+    Ok(blob.trim().to_owned())
+}
+
+fn part_path(index: usize) -> String {
+    format!("{BUNDLE_PATH}.part{index:04}")
 }
 
 fn push_ref(repo: &Path, remote: &str, reference: &str) -> Result<()> {
@@ -509,4 +608,110 @@ fn git_with_input(
         );
     }
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{FileEntry, FileKind, Manifest};
+
+    #[test]
+    fn escape_refs_keep_small_bundles_in_the_legacy_single_blob_format() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]).unwrap();
+        let encrypted = [MAGIC, b"small encrypted payload"].concat();
+
+        write_ref_with_max_blob_bytes(
+            root.path(),
+            "refs/pando/test",
+            "snapshot",
+            &encrypted,
+            encrypted.len(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_encrypted(root.path(), "refs/pando/test").unwrap(),
+            encrypted
+        );
+        let paths = String::from_utf8(
+            git(root.path(), &["ls-tree", "--name-only", "refs/pando/test"]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(paths, "snapshot.pando\n");
+    }
+
+    #[test]
+    fn escape_refs_split_large_bundles_into_verified_parts() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]).unwrap();
+        let contents = b"a payload larger than one test part";
+        let chunk = blake3::hash(contents).to_hex().to_string();
+        let entry = FileEntry {
+            chunk: chunk.clone(),
+            size: contents.len() as u64,
+            kind: FileKind::Regular,
+            executable: false,
+        };
+        let files = BTreeMap::from([("unfinished.txt".to_owned(), entry)]);
+        let mut manifest = Manifest {
+            id: String::new(),
+            repo_id: "repo".to_owned(),
+            trunk_id: "macbook".to_owned(),
+            created_at_ms: 1,
+            parent: None,
+            base_commit: None,
+            classification_version: 1,
+            ignore_patterns: Vec::new(),
+            files: files.clone(),
+        };
+        manifest.id = manifest_id(&manifest).unwrap();
+        let bundle = Bundle {
+            version: FORMAT_VERSION,
+            overlay: Overlay {
+                snapshot: manifest,
+                upserts: files,
+                deletes: Vec::new(),
+            },
+            chunks: BTreeMap::from([(chunk, contents.to_vec())]),
+        };
+        let plaintext =
+            bincode::serde::encode_to_vec(&bundle, bincode::config::standard()).unwrap();
+        let key = TransportKey::from_bytes([7; 32]);
+        let encrypted = encrypt(&plaintext, &key).unwrap();
+
+        write_ref_with_max_blob_bytes(root.path(), "refs/pando/test", "snapshot", &encrypted, 8)
+            .unwrap();
+
+        assert_eq!(
+            read_encrypted(root.path(), "refs/pando/test").unwrap(),
+            encrypted
+        );
+        let destination = root.path().join("restored");
+        restore(root.path(), "refs/pando/test", &key, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("unfinished.txt")).unwrap(),
+            contents
+        );
+        let paths = String::from_utf8(
+            git(root.path(), &["ls-tree", "--name-only", "refs/pando/test"]).unwrap(),
+        )
+        .unwrap();
+        let part_paths = paths
+            .lines()
+            .filter(|path| path.contains(".part"))
+            .collect::<Vec<_>>();
+        assert!(part_paths.len() > 1);
+        for path in part_paths {
+            let size = String::from_utf8(
+                git(
+                    root.path(),
+                    &["cat-file", "-s", &format!("refs/pando/test:{path}")],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(size.trim().parse::<usize>().unwrap() <= 8);
+        }
+    }
 }
