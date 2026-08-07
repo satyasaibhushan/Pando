@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const DEVICE_SYNC_WORKERS: usize = 2;
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const DEVICE_STARTUP_SCAN_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DEVICE_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -284,7 +285,13 @@ struct DeviceJob {
 struct DeviceJobResult {
     workspace: usize,
     kind: DeviceJobKind,
-    result: Result<()>,
+    result: Result<DeviceJobOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceJobOutcome {
+    Complete,
+    DeferredStartupScan,
 }
 
 #[derive(Clone, Debug)]
@@ -439,13 +446,24 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
         }
         while let Ok(completed) = result_receiver.try_recv() {
             schedules[completed.workspace].queued = false;
-            if let Err(error) = completed.result {
-                schedules[completed.workspace].retry =
-                    Some((Instant::now() + DEVICE_RETRY_INTERVAL, completed.kind));
-                eprintln!(
-                    "{} {:?} failed: {error:#}",
-                    workspaces[completed.workspace].label, completed.kind
-                );
+            match completed.result {
+                Ok(DeviceJobOutcome::Complete) => {}
+                Ok(DeviceJobOutcome::DeferredStartupScan) => {
+                    schedules[completed.workspace].next_full_scan = Instant::now()
+                        + spread(
+                            DEVICE_STARTUP_SCAN_WINDOW,
+                            completed.workspace,
+                            workspaces.len(),
+                        );
+                }
+                Err(error) => {
+                    schedules[completed.workspace].retry =
+                        Some((Instant::now() + DEVICE_RETRY_INTERVAL, completed.kind));
+                    eprintln!(
+                        "{} {:?} failed: {error:#}",
+                        workspaces[completed.workspace].label, completed.kind
+                    );
+                }
             }
         }
 
@@ -525,7 +543,7 @@ fn run_device_job(
     authority: &RemoteAuthority,
     network_key: Option<&TransportKey>,
     rehydrate: bool,
-) -> Result<()> {
+) -> Result<DeviceJobOutcome> {
     let clock = SystemClock;
     match kind {
         DeviceJobKind::Initial => {
@@ -548,11 +566,16 @@ fn run_device_job(
             if should_push {
                 publish_device_workspace(workspace, &trunk, authority, network_key, &clock)?;
             }
-            Ok(())
+            Ok(if matches!(pull, PullResult::UpToDate { .. }) {
+                DeviceJobOutcome::DeferredStartupScan
+            } else {
+                DeviceJobOutcome::Complete
+            })
         }
         DeviceJobKind::Push | DeviceJobKind::FullScan => {
             let trunk = Trunk::open(&workspace.path, &workspace.id, device_id)?;
-            publish_device_workspace(workspace, &trunk, authority, network_key, &clock)
+            publish_device_workspace(workspace, &trunk, authority, network_key, &clock)?;
+            Ok(DeviceJobOutcome::Complete)
         }
         DeviceJobKind::Pull => {
             let trunk = Trunk::open(&workspace.path, &workspace.id, device_id)?;
@@ -570,7 +593,7 @@ fn run_device_job(
                     Hydrator::open(&workspace.path)?.run_changed(false)?
                 );
             }
-            Ok(())
+            Ok(DeviceJobOutcome::Complete)
         }
     }
 }
@@ -625,7 +648,10 @@ fn spread(interval: Duration, index: usize, total: usize) -> Duration {
 }
 
 fn initial_should_push(result: &PullResult) -> bool {
-    !matches!(result, PullResult::Applied { .. })
+    matches!(
+        result,
+        PullResult::NoSnapshots | PullResult::Diverged { .. }
+    )
 }
 
 fn push_and_release(
@@ -828,6 +854,7 @@ mod tests {
         let interval = Duration::from_secs(60);
         assert_eq!(spread(interval, 0, 100), Duration::ZERO);
         assert_eq!(spread(interval, 50, 100), Duration::from_secs(30));
+        assert!(DEVICE_STARTUP_SCAN_WINDOW >= Duration::from_secs(10 * 60));
         assert!(DEVICE_FULL_SCAN_INTERVAL >= Duration::from_secs(6 * 60 * 60));
         assert!(DEVICE_RETRY_INTERVAL >= Duration::from_secs(30));
     }
@@ -839,5 +866,9 @@ mod tests {
             authority_head: "authority-head".into(),
         };
         assert!(initial_should_push(&result));
+        assert!(!initial_should_push(&PullResult::UpToDate {
+            snapshot: "shared-head".into()
+        }));
+        assert!(initial_should_push(&PullResult::NoSnapshots));
     }
 }
