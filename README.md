@@ -149,7 +149,7 @@ Audit an authority store without modifying it:
 pando verify --data ~/.local/share/pando/authority
 ```
 
-The audit rehashes every stored chunk, recomputes every snapshot ID, validates overlay shape and byte lengths, walks parent chains, and checks that every repository head resolves to a snapshot for that repository. For the cleanest point-in-time result, run it while the authority is idle; a concurrent publication can produce a transient mismatch that is safe to retry.
+The audit rehashes every stored chunk, recomputes every snapshot ID, validates overlay shape and byte lengths, walks parent chains, and checks that every repository head resolves to a snapshot for that repository. It pins the authority state before enumerating immutable snapshots, so publications may continue safely during the point-in-time audit.
 
 Preview storage reclamation with `pando gc --data ~/.local/share/pando/authority`. Pando retains overlay upserts plus portable `.git` state; files already absorbed by a pushed base are reconstructed from that pinned Git commit during pull, authority restore, and encrypted escape recovery. GC can therefore discard absorbed base-file chunks as well as snapshots unreachable from every head or pending fork and chunks used only by those snapshots. It verifies before reporting. Stop the authority service and pass `--apply` to delete exactly that collectable set; retained head/fork ancestry remains restorable and is verified again afterward.
 

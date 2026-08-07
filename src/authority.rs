@@ -148,6 +148,10 @@ impl FileAuthority {
 
     pub fn verify(&self) -> Result<AuthorityVerification> {
         let store = self.chunks.verify_all()?;
+        // Pin the head/fork view before enumerating immutable overlays. A
+        // concurrent publication may add data after this point, but it cannot
+        // make this point-in-time state reference an overlay we did not see.
+        let state = self.load_state()?;
         let mut overlays = BTreeMap::new();
         for entry in fs::read_dir(self.root.join("overlays"))? {
             let entry = entry?;
@@ -209,7 +213,6 @@ impl FileAuthority {
             }
         }
 
-        let state = self.load_state()?;
         for (repo_id, head) in &state.heads {
             let overlay = overlays
                 .get(head)
