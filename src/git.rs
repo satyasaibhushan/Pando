@@ -28,6 +28,7 @@ pub fn fetch_remotes(repo: &Path) -> Result<FetchReport> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(["fetch", "--all", "--prune", "--no-write-fetch-head"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
@@ -223,7 +224,16 @@ fn pack_local_objects(
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["-c", "pack.threads=1", "pack-objects", "--quiet"])
+        .args([
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "pack.threads=1",
+            "pack-objects",
+            "--quiet",
+        ])
         .arg(staging.join("pack"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -322,6 +332,7 @@ fn fetch_remote_objects(repo: &Path, remotes: &str, staging: &Path) -> Result<()
                 let fetched = Command::new("git")
                     .arg("-C")
                     .arg(&clean_room)
+                    .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
                     .args([
                         "fetch",
                         "--quiet",
@@ -456,6 +467,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .output()
         .with_context(|| format!("run git {}", args.join(" ")))?;
@@ -473,6 +485,7 @@ fn git_succeeds(repo: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .status()
         .is_ok_and(|status| status.success())
