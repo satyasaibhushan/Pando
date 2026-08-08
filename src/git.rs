@@ -28,6 +28,7 @@ pub fn fetch_remotes(repo: &Path) -> Result<FetchReport> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(["fetch", "--all", "--prune", "--no-write-fetch-head"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
@@ -165,7 +166,18 @@ pub fn pushed_base(repo: &Path) -> Result<Option<String>> {
 /// `.git/objects/pack/` paths. Covers all local refs, stashes, reflog entries,
 /// and the index; a repository with no remotes packs its full history.
 pub fn local_pack_entries(repo: &Path, store: &ChunkStore) -> Result<BTreeMap<String, FileEntry>> {
-    let staging = std::env::temp_dir().join(format!(
+    // Git creates pack temporaries beside its object database before renaming
+    // them to this destination. Keep both on the repository filesystem so
+    // Linux repositories mounted at /srv do not fail with EXDEV when /tmp is
+    // a different filesystem.
+    let objects = String::from_utf8(git(repo, &["rev-parse", "--git-path", "objects"])?)?;
+    let objects = Path::new(objects.trim());
+    let objects = if objects.is_absolute() {
+        objects.to_owned()
+    } else {
+        repo.join(objects)
+    };
+    let staging = objects.join(format!(
         "pando-pack-{}-{}",
         std::process::id(),
         &blake3::hash(repo.to_string_lossy().as_bytes())
@@ -212,7 +224,16 @@ fn pack_local_objects(
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["-c", "pack.threads=1", "pack-objects", "--quiet"])
+        .args([
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "pack.threads=1",
+            "pack-objects",
+            "--quiet",
+        ])
         .arg(staging.join("pack"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -287,52 +308,67 @@ fn fetch_all_remote_objects(repo: &Path) -> Result<()> {
             .to_hex()
             .to_string()[..12]
     ));
-    let result = (|| {
-        let mut failure = None;
-        for remote in remotes
-            .lines()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            let attempt = (|| {
-                let url = String::from_utf8(git(repo, &["remote", "get-url", remote])?)?
-                    .trim()
-                    .to_owned();
-                let clean_room = staging.join(remote);
-                std::fs::create_dir_all(&clean_room)?;
-                git(&clean_room, &["init", "--quiet", "--bare"])?;
+    let result = fetch_remote_objects(repo, &remotes, &staging);
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn fetch_remote_objects(repo: &Path, remotes: &str, staging: &Path) -> Result<()> {
+    let mut failure = None;
+    for remote in remotes
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let attempt = (|| {
+            let url = String::from_utf8(git(repo, &["remote", "get-url", remote])?)?
+                .trim()
+                .to_owned();
+            let clean_room = staging.join(remote);
+            std::fs::create_dir_all(&clean_room)?;
+            git(&clean_room, &["init", "--quiet", "--bare"])?;
+            let mut last_error = None;
+            for candidate in fetch_urls(&url) {
                 let fetched = Command::new("git")
                     .arg("-C")
                     .arg(&clean_room)
+                    .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
                     .args([
                         "fetch",
                         "--quiet",
-                        &url,
+                        &candidate,
                         "+refs/heads/*:refs/heads/*",
                         "+refs/tags/*:refs/tags/*",
                     ])
                     .env("GIT_TERMINAL_PROMPT", "0")
                     .output()
                     .context("run git fetch")?;
-                if !fetched.status.success() {
-                    bail!(
-                        "git fetch {remote} failed: {}",
-                        String::from_utf8_lossy(&fetched.stderr).trim()
-                    );
+                if fetched.status.success() {
+                    return copy_objects(&clean_room.join("objects"), &repo.join(".git/objects"));
                 }
-                copy_objects(&clean_room.join("objects"), &repo.join(".git/objects"))
-            })();
-            if let Err(error) = attempt {
-                failure.get_or_insert(error);
+                last_error = Some(String::from_utf8_lossy(&fetched.stderr).trim().to_owned());
             }
+            bail!(
+                "git fetch {remote} failed: {}",
+                last_error.as_deref().unwrap_or("no usable remote URL")
+            )
+        })();
+        if let Err(error) = attempt {
+            failure.get_or_insert(error);
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    })();
-    let _ = std::fs::remove_dir_all(&staging);
-    result
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn fetch_urls(url: &str) -> Vec<String> {
+    let mut urls = vec![url.to_owned()];
+    if let Some(path) = url.strip_prefix("https://github.com/") {
+        urls.push(format!("git@github.com:{path}"));
+    }
+    urls
 }
 
 fn copy_objects(source: &Path, destination: &Path) -> Result<()> {
@@ -431,6 +467,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .output()
         .with_context(|| format!("run git {}", args.join(" ")))?;
@@ -448,7 +485,28 @@ fn git_succeeds(repo: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetch_urls;
+
+    #[test]
+    fn private_github_fetch_can_fall_back_to_ssh() {
+        assert_eq!(
+            fetch_urls("https://github.com/example/private.git"),
+            vec![
+                "https://github.com/example/private.git",
+                "git@github.com:example/private.git"
+            ]
+        );
+        assert_eq!(
+            fetch_urls("ssh://git@example.test/repo.git"),
+            vec!["ssh://git@example.test/repo.git"]
+        );
+    }
 }

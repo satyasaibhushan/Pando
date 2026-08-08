@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use pando::authority::{Authority, FileAuthority};
 use pando::classify::Classifier;
@@ -12,6 +12,11 @@ use pando::transport::{RemoteAuthority, TransportKey};
 use std::fs;
 use std::net::{IpAddr, UdpSocket};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -73,6 +78,12 @@ enum Command {
     Sync,
     /// Open the dashboard
     Tui,
+    /// Run the single background process for this device
+    #[command(hide = true)]
+    Daemon {
+        #[arg(long)]
+        rehydrate: bool,
+    },
     #[command(hide = true)]
     Serve {
         #[arg(long, default_value = "0.0.0.0:7337")]
@@ -290,16 +301,35 @@ fn main() -> Result<()> {
                 &config.network_id[..12.min(config.network_id.len())],
                 config.device_name
             );
-            for share in &config.shares {
-                for workspace in &share.workspaces {
-                    let status = authority.status(&workspace.id, SystemClock.now_ms())?;
-                    let state = if status.forks.is_empty() {
-                        "in sync".to_owned()
-                    } else {
-                        format!("needs decision ({})", status.forks.len())
-                    };
-                    println!("{}/{}: {state}", share.name, workspace.name);
-                }
+            let workspaces = config
+                .shares
+                .iter()
+                .flat_map(|share| {
+                    share
+                        .workspaces
+                        .iter()
+                        .map(move |workspace| (share, workspace))
+                })
+                .collect::<Vec<_>>();
+            let repo_ids = workspaces
+                .iter()
+                .map(|(_, workspace)| workspace.id.clone())
+                .collect::<Vec<_>>();
+            let statuses = authority.statuses(&repo_ids, SystemClock.now_ms())?;
+            for ((share, workspace), status) in workspaces.into_iter().zip(statuses) {
+                let path = config.workspace_path(share, workspace);
+                let local_head =
+                    Trunk::open(&path, &workspace.id, &config.device_id)?.local_head()?;
+                let state = if !status.forks.is_empty() {
+                    format!("needs decision ({})", status.forks.len())
+                } else if local_head.is_none() && status.head.is_none() {
+                    "waiting for initial sync".to_owned()
+                } else if local_head == status.head {
+                    "in sync".to_owned()
+                } else {
+                    "syncing".to_owned()
+                };
+                println!("{}/{}: {state}", share.name, workspace.name);
             }
             Ok(())
         }
@@ -309,6 +339,7 @@ fn main() -> Result<()> {
             push_shares(&config, &mut authority, None)
         }
         Command::Tui => pando::tui::run(pando::config::load()?),
+        Command::Daemon { rehydrate } => run_daemon(pando::config::load()?, rehydrate),
         Command::Serve { bind, data } => {
             let data = match data {
                 Some(data) => data,
@@ -663,8 +694,13 @@ fn share(folder: &Path, name: Option<String>, no_services: bool) -> Result<()> {
     });
     pando::config::save(&config)?;
     println!("hosting {name} · join it elsewhere with `pando join {name}`");
-    push_shares(&config, &mut authority, Some(&name))?;
-    ensure_services(&config, no_services)
+    if no_services {
+        push_shares(&config, &mut authority, Some(&name))
+    } else {
+        ensure_services(&config, false)?;
+        println!("initial sync is continuing in the background · check with `pando status`");
+        Ok(())
+    }
 }
 
 fn join(name: &str, path: Option<PathBuf>, no_services: bool) -> Result<()> {
@@ -700,21 +736,30 @@ fn join(name: &str, path: Option<PathBuf>, no_services: bool) -> Result<()> {
     for workspace in &local.workspaces {
         let workspace_path = config.workspace_path(&local, workspace);
         fs::create_dir_all(&workspace_path)?;
-        let trunk = Trunk::open(&workspace_path, &workspace.id, &config.device_id)?;
-        println!("{}/{}: syncing", name, workspace.name);
-        let started = Instant::now();
-        let result = trunk.pull(&authority, &SystemClock)?;
-        println!(
-            "{}/{}: {} in {:.1}s",
-            name,
-            workspace.name,
-            describe_pull(&result),
-            started.elapsed().as_secs_f64()
-        );
     }
-    config.upsert_share(local);
+    config.upsert_share(local.clone());
     pando::config::save(&config)?;
-    ensure_services(&config, no_services)
+    if no_services {
+        for workspace in &local.workspaces {
+            let workspace_path = config.workspace_path(&local, workspace);
+            let trunk = Trunk::open(&workspace_path, &workspace.id, &config.device_id)?;
+            println!("{}/{}: syncing", name, workspace.name);
+            let started = Instant::now();
+            let result = trunk.pull(&authority, &SystemClock)?;
+            println!(
+                "{}/{}: {} in {:.1}s",
+                name,
+                workspace.name,
+                describe_pull(&result),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(())
+    } else {
+        ensure_services(&config, false)?;
+        println!("initial sync is continuing in the background · check with `pando status`");
+        Ok(())
+    }
 }
 
 fn push_shares(
@@ -761,8 +806,8 @@ fn push_shares(
     Ok(())
 }
 
-/// Install (or refresh) the background services this device needs: the
-/// authority when it hosts one, and a watcher per joined workspace.
+/// Install (or refresh) the one background service for this device. It owns
+/// the local authority when needed and supervises every joined workspace.
 fn ensure_services(config: &DeviceConfig, no_services: bool) -> Result<()> {
     if no_services {
         return Ok(());
@@ -777,22 +822,88 @@ fn ensure_services(config: &DeviceConfig, no_services: bool) -> Result<()> {
             return Ok(());
         }
     };
-    let mut kinds = Vec::new();
+    for service in pando::service::remove_obsolete(platform)? {
+        println!("removed superseded service {service}");
+    }
+    let report = pando::service::install(
+        &pando::service::ServiceKind::Daemon,
+        &binary,
+        platform,
+        None,
+        true,
+    )?;
     if hosts_authority(config) {
-        kinds.push(pando::service::ServiceKind::Authority);
+        wait_for_authority(config)?;
     }
-    for share in &config.shares {
-        for workspace in &share.workspaces {
-            kinds.push(pando::service::ServiceKind::Watch {
-                workspace_id: workspace.id.clone(),
-            });
-        }
-    }
-    for kind in kinds {
-        let report = pando::service::install(&kind, &binary, platform, None, true)?;
-        println!("service {} running", report.service_name);
-    }
+    println!("service {} running", report.service_name);
     Ok(())
+}
+
+fn wait_for_authority(config: &DeviceConfig) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if remote(config)
+            .and_then(|authority| authority.devices())
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Pando service started but its authority is not ready at {}",
+                config.authority
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_daemon(config: DeviceConfig, rehydrate: bool) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    let signal = running.clone();
+    ctrlc::set_handler(move || signal.store(false, Ordering::SeqCst))?;
+    let authority_error = Arc::new(Mutex::new(None));
+
+    if hosts_authority(&config) {
+        let data = pando::config::authority_data_path()?;
+        let bind = authority_bind(&config)?;
+        let authority_error = authority_error.clone();
+        let authority_running = running.clone();
+        thread::spawn(move || {
+            let result = Registry::open(&data).and_then(|registry| {
+                println!(
+                    "Pando authority for network {} listening on {bind}",
+                    &registry.network_id()?[..12]
+                );
+                pando::transport::serve(&bind, FileAuthority::open(&data)?, registry)
+            });
+            if let Err(error) = result {
+                *authority_error
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) =
+                    Some(anyhow!("authority stopped: {error:#}"));
+                authority_running.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+    let result = pando::daemon::watch_device(config, rehydrate, running);
+    if let Some(error) = authority_error
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        return Err(error);
+    }
+    result
+}
+
+fn authority_bind(config: &DeviceConfig) -> Result<String> {
+    let (_, port) = config
+        .authority
+        .rsplit_once(':')
+        .context("local authority address has no port")?;
+    let port: u16 = port.parse().context("local authority port is invalid")?;
+    Ok(format!("0.0.0.0:{port}"))
 }
 
 fn hosts_authority(config: &DeviceConfig) -> bool {

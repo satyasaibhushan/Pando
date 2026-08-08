@@ -188,8 +188,11 @@ impl Trunk {
                 if !conflicts.is_empty() {
                     let fork_overlay = overlay_against(&self.repo, local, &self.chunks)?;
                     self.upload_missing_chunks(authority, &fork_overlay)?;
+                    if let Some(held) = self.refresh_lease(authority, clock)? {
+                        return Ok(held);
+                    }
                     let fork = fork_overlay.snapshot.id.clone();
-                    authority.publish_fork(&fork_overlay, &self.trunk_id, now_ms)?;
+                    authority.publish_fork(&fork_overlay, &self.trunk_id, clock.now_ms())?;
                     return Ok(PushResult::Conflicted {
                         local_head: state.head.unwrap_or_else(|| fork.clone()),
                         authority_head,
@@ -231,7 +234,10 @@ impl Trunk {
             }
             let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
             let uploaded = self.upload_missing_chunks(authority, &overlay)?;
-            authority.publish(&overlay, &self.trunk_id, now_ms)?;
+            if let Some(held) = self.refresh_lease(authority, clock)? {
+                return Ok(held);
+            }
+            authority.publish(&overlay, &self.trunk_id, clock.now_ms())?;
             let snapshot = overlay.snapshot.id.clone();
             let exposure_bytes = overlay.bytes();
             state.head = Some(snapshot.clone());
@@ -251,6 +257,25 @@ impl Trunk {
             let _ = authority.release(&self.repo_id, &self.trunk_id);
         }
         result
+    }
+
+    fn refresh_lease<A: Authority + ?Sized, C: Clock>(
+        &self,
+        authority: &mut A,
+        clock: &C,
+    ) -> Result<Option<PushResult>> {
+        match authority.acquire(
+            &self.repo_id,
+            &self.trunk_id,
+            clock.now_ms(),
+            DEFAULT_LEASE_TTL_MS,
+        )? {
+            AcquireResult::Acquired(_) => Ok(None),
+            AcquireResult::HeldBy(lease) => Ok(Some(PushResult::LeaseHeld {
+                holder: lease.holder,
+                expires_at_ms: lease.expires_at_ms,
+            })),
+        }
     }
 
     pub fn pull<A: Authority + ?Sized, C: Clock>(
@@ -397,6 +422,25 @@ impl Trunk {
             });
         }
 
+        // Ship the snapshot's chunks before taking the write lease: on a slow
+        // link the upload alone can outlast the lease, and publishing must
+        // happen while it is still fresh.
+        let mut manifest = if choice == ReconcileChoice::Fork {
+            fork.snapshot.clone()
+        } else {
+            current.clone()
+        };
+        manifest.id.clear();
+        manifest.trunk_id = self.trunk_id.clone();
+        manifest.created_at_ms = clock.now_ms();
+        manifest.parent = Some(authority_head.clone());
+        manifest.id = manifest_id(&manifest)?;
+        let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
+        for entry in overlay.upserts.values() {
+            if !authority.has_chunk(&entry.chunk)? {
+                authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
+            }
+        }
         match authority.acquire(
             &self.repo_id,
             &self.trunk_id,
@@ -411,22 +455,6 @@ impl Trunk {
         let result = (|| -> Result<ReconcileResult> {
             if authority.head(&self.repo_id)?.as_deref() != Some(&authority_head) {
                 anyhow::bail!("authority head changed during reconciliation");
-            }
-            let mut manifest = if choice == ReconcileChoice::Fork {
-                fork.snapshot.clone()
-            } else {
-                current.clone()
-            };
-            manifest.id.clear();
-            manifest.trunk_id = self.trunk_id.clone();
-            manifest.created_at_ms = clock.now_ms();
-            manifest.parent = Some(authority_head);
-            manifest.id = manifest_id(&manifest)?;
-            let overlay = overlay_against(&self.repo, manifest, &self.chunks)?;
-            for entry in overlay.upserts.values() {
-                if !authority.has_chunk(&entry.chunk)? {
-                    authority.put_chunk(&entry.chunk, &self.chunks.get(&entry.chunk)?)?;
-                }
             }
             authority.publish(&overlay, &self.trunk_id, clock.now_ms())?;
             if choice == ReconcileChoice::Fork {
@@ -833,5 +861,64 @@ pub(crate) fn default_data_root() -> Result<PathBuf> {
         } else {
             Ok(PathBuf::from(home).join(".local/share/pando"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authority::FileAuthority;
+    use crate::clock::VirtualClock;
+
+    #[test]
+    fn refreshes_a_lease_lost_during_expensive_snapshot_work() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let trunk =
+            Trunk::open_with_state(&repo, "workspace", "macbook", root.path().join("trunk"))
+                .unwrap();
+        let mut authority = FileAuthority::open(root.path().join("authority")).unwrap();
+        let clock = VirtualClock::at(1_000);
+
+        authority
+            .acquire("workspace", "macbook", clock.now_ms(), DEFAULT_LEASE_TTL_MS)
+            .unwrap();
+        clock.advance(DEFAULT_LEASE_TTL_MS + 1);
+        authority
+            .acquire("workspace", "devbox", clock.now_ms(), DEFAULT_LEASE_TTL_MS)
+            .unwrap();
+        authority.release("workspace", "devbox").unwrap();
+
+        assert!(
+            trunk
+                .refresh_lease(&mut authority, &clock)
+                .unwrap()
+                .is_none()
+        );
+        let status = authority.status("workspace", clock.now_ms()).unwrap();
+        assert_eq!(status.lease.unwrap().holder, "macbook");
+    }
+
+    #[test]
+    fn refresh_backs_off_when_another_device_still_holds_the_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let trunk =
+            Trunk::open_with_state(&repo, "workspace", "macbook", root.path().join("trunk"))
+                .unwrap();
+        let mut authority = FileAuthority::open(root.path().join("authority")).unwrap();
+        let clock = VirtualClock::at(1_000);
+        authority
+            .acquire("workspace", "devbox", clock.now_ms(), DEFAULT_LEASE_TTL_MS)
+            .unwrap();
+
+        let held = trunk
+            .refresh_lease(&mut authority, &clock)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            held,
+            PushResult::LeaseHeld { holder, .. } if holder == "devbox"
+        ));
     }
 }

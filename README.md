@@ -21,7 +21,7 @@ cargo run -- demo
 
 Pando is device-first: machines join a network once, then pick which hosted folders they carry. Build the release binary on every machine.
 
-On the first device — ideally the always-on one — bring up a network and host a folder. Pando recursively discovers the Git repositories below the folder, assigns stable workspace IDs, and installs background services (the authority plus one watcher per repository):
+On the first device — ideally the always-on one — bring up a network and host a folder. Pando recursively discovers the Git repositories below the folder, assigns stable workspace IDs, and installs one background daemon for the whole device. That process owns the authority when needed and supervises every repository with bounded sync concurrency:
 
 ```sh
 pando up
@@ -41,6 +41,8 @@ pando up --to HOST_IP:7337 --code xxxxx-xxxxx
 pando join code            # lands in ~/Pando/code, or pass a path
 ```
 
+`share` and `join` return after the folder is configured and the device daemon is ready. Initial transfer continues in the background, with at most two repositories scanning or transferring at once so onboarding cannot overwhelm the machine. Background services run with reduced CPU and I/O priority; systemd also caps Pando at half a CPU and starts reclaim pressure above 512 MB. `pando status` reports `waiting for initial sync`, `syncing`, `in sync`, or `needs decision` for each repository. Pass `--no-services` when you deliberately want the command to perform the complete initial transfer in the foreground.
+
 Enrollment mints per-device credentials over an encrypted channel — nothing secret is copied between machines by hand, and `pando revoke <device>` expels a machine instantly. Existing disjoint files and subfolders are unioned on first join. If the same path differs, neither side is overwritten: Pando preserves the joining device as a pending version for an explicit decision in the TUI.
 
 Day-to-day commands:
@@ -53,11 +55,11 @@ pando status     # per-folder sync state
 pando sync       # one-shot push of every joined folder
 ```
 
-`up`, `share`, and `join` install launchd/systemd services automatically; pass `--no-services` to skip that. The daemon watches changes, performs a full classified scan every 60 seconds, fetches Git remotes every 30 seconds, and synchronizes dirty files plus `.git` state without checking out, merging, rebasing, or pulling.
+`up`, `share`, and `join` install the device daemon as a launchd/systemd service automatically; pass `--no-services` to skip that. Upgrading automatically stops and removes the old authority and per-repository watcher services. Local filesystem events are published after a short quiescence; remote checks are spread across each minute instead of waking every repository together. Classified integrity scans are spread across six hours. Git history is fetched only when materialization needs a missing base (or when you explicitly run the hidden `pando fetch` diagnostic), and encrypted escape refs are exported only after a repository actually publishes. This keeps large repository collections quiet while idle without affecting event-driven local publishing. Pando synchronizes dirty files plus `.git` state without checking out, merging, rebasing, or pulling.
 
 When a path changed on both devices, the TUI shows `Needs your decision`. It offers: keep the network version, keep this device, keep both copies, open the selected file in `$VISUAL`/`$EDITOR`, or publish a manual resolution. Every materializing choice asks for confirmation. The daemon remains non-interactive and never blocks waiting for terminal input.
 
-Every TCP RPC runs inside a Noise `NNpsk0` session using ChaCha20-Poly1305. Each device holds its own transport key, minted at enrollment; wrong-key and legacy plaintext clients are rejected, and revocation deletes the device's key from the registry. A separate network key encrypts escape bundles pushed to Git remotes — a revoked device keeps that key, so it can still read escape bundles it already had access to; rotate it if that matters. The self-hosted authority is trusted and stores the synchronized data in readable form on that machine, just as the endpoint machines do. Ciphertext-only storage is required before a hosted, untrusted Pando authority.
+Every TCP RPC runs inside a Noise `NNpsk0` session using ChaCha20-Poly1305. Each device holds its own transport key, minted at enrollment; wrong-key and legacy plaintext clients are rejected, and revocation deletes the device's key from the registry. A separate network key encrypts escape bundles pushed to Git remotes — a revoked device keeps that key, so it can still read escape bundles it already had access to; rotate it if that matters. Escape bundles larger than 90 MiB are stored as independently sized Git blobs with a verified manifest, then reassembled transparently during recovery so common remote file-size limits do not disable the fallback. The self-hosted authority is trusted and stores the synchronized data in readable form on that machine, just as the endpoint machines do. Ciphertext-only storage is required before a hosted, untrusted Pando authority.
 
 The lower-level `serve`, `watch`, `reconcile`, `verify`, `gc`, and `restore` commands remain available (hidden from `--help`) for diagnostics and custom deployments.
 
@@ -65,11 +67,11 @@ The lower-level `serve`, `watch`, `reconcile`, `verify`, `gc`, and `restore` com
 
 Pando syncs portable working state by default, including Git-ignored secrets such as `.env`. It excludes conservative built-in derived and machine-local paths:
 
-- Rust `target/` at the repository root.
+- Rust `target/` at the repository root, SwiftPM `.build/`, and TypeScript incremental build metadata.
 - `node_modules/`, Python virtual environments and caches, Gradle/Next/Turbo/Parcel caches.
 - Python bytecode, `.DS_Store`, `Thumbs.db`, sockets, and other special files.
 
-Add repository-specific rules to `.pandoignore` using Git-ignore syntax. User-wide rules use the same syntax in `~/.config/pando/ignore` (or `$PANDO_CONFIG_HOME/ignore`; `$XDG_CONFIG_HOME/pando/ignore` is also honored). Precedence is built-ins, then user-wide rules, then repository rules, so the repository can make the final override. The flattened policy is stored in each snapshot so receivers materialize it consistently. For example, `!/target/` explicitly makes the root `target/` portable. `.git/` and `.pandoignore` itself always remain portable, while the root `.pando/` directory always remains local.
+Add repository-specific rules to `.pandoignore` using Git-ignore syntax. User-wide rules use the same syntax in `~/.config/pando/ignore` (or `$PANDO_CONFIG_HOME/ignore`; `$XDG_CONFIG_HOME/pando/ignore` is also honored). Precedence is built-ins, then user-wide rules, then repository rules, so the repository can make the final override. The flattened policy is stored in each snapshot so receivers materialize it consistently. For example, `!/target/` explicitly makes the root `target/` portable. Portable `.git/` state includes the index, HEAD, local and remote-tracking branches, tags, stash, hooks, and in-progress operation markers. Regenerable machine-local Git bookkeeping—reflogs other than the stash log, `FETCH_HEAD`, `ORIG_HEAD`, `COMMIT_EDITMSG`, lock files, worktree registrations, and `.DS_Store`—stays local and never creates a cross-device conflict. `.pandoignore` itself always remains portable, while the root `.pando/` directory always remains local.
 
 Pando intentionally does not inherit `.gitignore`: Git-ignored files are often exactly the uncommitted state Pando exists to carry. Use `.pandoignore` for additional derived or local-only paths.
 
@@ -147,9 +149,9 @@ Audit an authority store without modifying it:
 pando verify --data ~/.local/share/pando/authority
 ```
 
-The audit rehashes every stored chunk, recomputes every snapshot ID, validates overlay shape and byte lengths, walks parent chains, and checks that every repository head resolves to a snapshot for that repository. For the cleanest point-in-time result, run it while the authority is idle; a concurrent publication can produce a transient mismatch that is safe to retry.
+The audit rehashes every stored chunk, recomputes every snapshot ID, validates overlay shape and byte lengths, walks parent chains, and checks that every repository head resolves to a snapshot for that repository. It pins the authority state before enumerating immutable snapshots, so publications may continue safely during the point-in-time audit.
 
-Preview storage reclamation with `pando gc --data ~/.local/share/pando/authority`. Pando retains overlay upserts plus complete `.git` state; files already absorbed by a pushed base are reconstructed from that pinned Git commit during pull, authority restore, and encrypted escape recovery. GC can therefore discard absorbed base-file chunks as well as snapshots unreachable from every head or pending fork and chunks used only by those snapshots. It verifies before reporting. Stop the authority service and pass `--apply` to delete exactly that collectable set; retained head/fork ancestry remains restorable and is verified again afterward.
+Preview storage reclamation with `pando gc --data ~/.local/share/pando/authority`. Pando retains overlay upserts plus portable `.git` state; files already absorbed by a pushed base are reconstructed from that pinned Git commit during pull, authority restore, and encrypted escape recovery. GC can therefore discard absorbed base-file chunks as well as snapshots unreachable from every head or pending fork and chunks used only by those snapshots. It verifies before reporting. Stop the authority service and pass `--apply` to delete exactly that collectable set; retained head/fork ancestry remains restorable and is verified again afterward.
 
 Restore any retained snapshot into a new path:
 

@@ -3,6 +3,7 @@ use pando::authority::{AcquireResult, Authority, FileAuthority};
 use pando::clock::{SystemClock, VirtualClock};
 use pando::model::{FileEntry, FileKind, Manifest, Overlay};
 use pando::snapshot::manifest_id;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use pando::store::ChunkStore;
 use pando::sync::{PullResult, PushResult, Trunk};
 use pando::transport::{RemoteAuthority, TransportKey};
@@ -1630,8 +1631,15 @@ fn git_branch_stash_index_and_dirty_files_follow_the_user() {
     )
     .unwrap();
     first.push(&mut authority, &clock).unwrap();
+    let snapshot = authority
+        .overlay(&authority.head("git-repo").unwrap().unwrap())
+        .unwrap();
+    assert!(snapshot.snapshot.files.contains_key(".git/refs/stash"));
+    assert!(snapshot.snapshot.files.contains_key(".git/logs/refs/stash"));
     first.release(&mut authority).unwrap();
     second.pull(&authority, &clock).unwrap();
+    assert!(linuxbox.join(".git/refs/stash").is_file());
+    assert!(linuxbox.join(".git/logs/refs/stash").is_file());
 
     assert_eq!(
         fs::read_to_string(linuxbox.join("tracked.txt")).unwrap(),
@@ -1753,7 +1761,10 @@ fn git_history_travels_as_a_thin_pack_and_stays_remote_until_needed() {
 
     // The first real git change cannot reuse the pack; it forces the
     // one-time lazy fetch of the remote-reachable boundary.
-    git(&linuxbox, &["config", "user.email", "receiver@example.test"]);
+    git(
+        &linuxbox,
+        &["config", "user.email", "receiver@example.test"],
+    );
     git(&linuxbox, &["config", "user.name", "Pando Receiver"]);
     clock.advance(1_000);
     let published = second.push(&mut authority, &clock).unwrap();

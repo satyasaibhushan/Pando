@@ -34,6 +34,7 @@ pub fn capture(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_with_policy(
     repo: &Path,
     repo_id: &str,
@@ -60,6 +61,7 @@ pub(crate) fn capture_with_policy(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_with_classifier(
     canonical_repo: &Path,
     repo_id: &str,
