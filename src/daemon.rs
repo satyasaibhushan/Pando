@@ -279,15 +279,10 @@ enum DeviceJobKind {
     FullScan,
 }
 
-enum DeviceJob {
-    Sync {
-        index: usize,
-        workspace: Arc<DeviceWorkspace>,
-        kind: DeviceJobKind,
-    },
-    Refresh {
-        shares: Vec<ShareConfig>,
-    },
+struct DeviceJob {
+    index: usize,
+    workspace: Arc<DeviceWorkspace>,
+    kind: DeviceJobKind,
 }
 
 enum DeviceJobResult {
@@ -473,13 +468,6 @@ pub fn watch_device(
         "Pando daemon managing {} workspace(s) with one watcher and {DEVICE_SYNC_WORKERS} sync workers",
         workspaces.len()
     );
-    if workspaces.is_empty() {
-        while running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        return Ok(());
-    }
-
     let global_rules = global_rules_path()?;
     let (event_sender, event_receiver) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -519,8 +507,6 @@ pub fn watch_device(
             device_key.clone(),
         );
         let device_id = config.device_id.clone();
-        let network_id = config.network_id.clone();
-        let device_name = config.device_name.clone();
         let network_key = network_key.clone();
         thread::Builder::new()
             .name(format!("pando-sync-{index}"))
@@ -530,32 +516,53 @@ pub fn watch_device(
                         let receiver = receiver.lock().unwrap_or_else(|error| error.into_inner());
                         receiver.recv()
                     };
-                    let Ok(job) = job else {
+                    let Ok(DeviceJob {
+                        index,
+                        workspace,
+                        kind,
+                    }) = job
+                    else {
                         break;
                     };
-                    let result =
-                        match job {
-                            DeviceJob::Sync {
-                                index,
-                                workspace,
-                                kind,
-                            } => DeviceJobResult::Sync {
-                                index,
-                                kind,
-                                result: run_device_job(
-                                    &workspace,
-                                    kind,
-                                    &device_id,
-                                    &authority,
-                                    network_key.as_ref(),
-                                    rehydrate,
-                                ),
-                            },
-                            DeviceJob::Refresh { shares } => DeviceJobResult::Refresh(
-                                refresh_shares(&network_id, &device_name, &shares, &authority),
-                            ),
-                        };
-                    if sender.send(result).is_err() {
+                    let result = run_device_job(
+                        &workspace,
+                        kind,
+                        &device_id,
+                        &authority,
+                        network_key.as_ref(),
+                        rehydrate,
+                    );
+                    if sender
+                        .send(DeviceJobResult::Sync {
+                            index,
+                            kind,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
+    }
+    // Discovery runs on its own thread: behind a backlog of slow scans a new
+    // repository would otherwise wait minutes before any device noticed it.
+    let (refresh_sender, refresh_receiver) = mpsc::channel::<Vec<ShareConfig>>();
+    {
+        let sender = result_sender.clone();
+        let authority = RemoteAuthority::new(
+            config.authority.clone(),
+            config.device_id.clone(),
+            device_key.clone(),
+        );
+        let network_id = config.network_id.clone();
+        let device_name = config.device_name.clone();
+        thread::Builder::new()
+            .name("pando-refresh".to_string())
+            .spawn(move || {
+                while let Ok(shares) = refresh_receiver.recv() {
+                    let result = refresh_shares(&network_id, &device_name, &shares, &authority);
+                    if sender.send(DeviceJobResult::Refresh(result)).is_err() {
                         break;
                     }
                 }
@@ -638,9 +645,7 @@ pub fn watch_device(
             refresh_dirty_at = None;
             refresh_queued = true;
             next_refresh = now + DEVICE_SHARE_REFRESH_INTERVAL;
-            job_sender.send(DeviceJob::Refresh {
-                shares: config.shares.clone(),
-            })?;
+            refresh_sender.send(config.shares.clone())?;
         }
         for (index, schedule) in schedules.iter_mut().enumerate() {
             if schedule.queued {
@@ -677,7 +682,7 @@ pub fn watch_device(
             };
             if let Some(kind) = kind {
                 schedule.queued = true;
-                job_sender.send(DeviceJob::Sync {
+                job_sender.send(DeviceJob {
                     index,
                     workspace: workspaces[index].clone(),
                     kind,
