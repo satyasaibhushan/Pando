@@ -1,14 +1,16 @@
 use crate::authority::Authority;
 use crate::classify::{Classifier, global_rules_path};
 use crate::clock::SystemClock;
-use crate::config::DeviceConfig;
+use crate::config::{DeviceConfig, ShareConfig, WorkspaceConfig};
 use crate::model::short_id;
+use crate::registry::ShareRecord;
 use crate::rehydrate::Hydrator;
 use crate::sync::{PullResult, PushResult, Trunk};
 use crate::transport::{RemoteAuthority, TransportKey};
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -22,6 +24,8 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const DEVICE_STARTUP_SCAN_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DEVICE_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const DEVICE_SHARE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DEVICE_DISCOVERY_QUIESCENCE: Duration = Duration::from_secs(2);
 
 pub struct WatchOptions {
     pub quiescence: Duration,
@@ -275,17 +279,24 @@ enum DeviceJobKind {
     FullScan,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DeviceJob {
-    workspace: usize,
-    kind: DeviceJobKind,
+enum DeviceJob {
+    Sync {
+        index: usize,
+        workspace: Arc<DeviceWorkspace>,
+        kind: DeviceJobKind,
+    },
+    Refresh {
+        shares: Vec<ShareConfig>,
+    },
 }
 
-#[derive(Debug)]
-struct DeviceJobResult {
-    workspace: usize,
-    kind: DeviceJobKind,
-    result: Result<DeviceJobOutcome>,
+enum DeviceJobResult {
+    Sync {
+        index: usize,
+        kind: DeviceJobKind,
+        result: Result<DeviceJobOutcome>,
+    },
+    Refresh(Result<Vec<ShareAddition>>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +312,114 @@ struct DeviceWorkspace {
     id: String,
 }
 
+impl DeviceWorkspace {
+    fn new(config: &DeviceConfig, share: &ShareConfig, workspace: &WorkspaceConfig) -> Self {
+        Self {
+            label: format!("{}/{}", share.name, workspace.name),
+            path: config.workspace_path(share, workspace),
+            id: workspace.id.clone(),
+        }
+    }
+}
+
+/// Workspaces a share gained since the daemon last looked: repositories that
+/// appeared under a folder this device hosts, or workspaces the host added to
+/// a folder this device joined.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShareAddition {
+    pub share: String,
+    pub workspaces: Vec<WorkspaceConfig>,
+}
+
+struct RefreshPlan {
+    additions: Vec<ShareAddition>,
+    upserts: Vec<ShareRecord>,
+}
+
+fn plan_share_refresh(
+    network_id: &str,
+    device_name: &str,
+    shares: &[ShareConfig],
+    records: &[ShareRecord],
+    discover: impl Fn(&Path) -> Result<Vec<PathBuf>>,
+) -> Result<RefreshPlan> {
+    let mut plan = RefreshPlan {
+        additions: Vec::new(),
+        upserts: Vec::new(),
+    };
+    for share in shares {
+        let Some(record) = records.iter().find(|record| record.name == share.name) else {
+            continue;
+        };
+        // A folder that is itself the repository has nothing beneath it to add.
+        if share
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.relative_path == Path::new("."))
+        {
+            continue;
+        }
+        let hosted_here = record.host == device_name;
+        let candidates = if hosted_here {
+            discover(&share.path)?
+                .into_iter()
+                .filter(|relative| relative.as_path() != Path::new("."))
+                .map(|relative| {
+                    crate::config::workspace(network_id, &share.name, &share.path, relative)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            record.workspaces.clone()
+        };
+        let added = candidates
+            .into_iter()
+            .filter(|candidate| {
+                !share
+                    .workspaces
+                    .iter()
+                    .any(|existing| existing.id == candidate.id)
+            })
+            .collect::<Vec<_>>();
+        if added.is_empty() {
+            continue;
+        }
+        if hosted_here {
+            let mut record = record.clone();
+            record.workspaces = share.workspaces.iter().chain(&added).cloned().collect();
+            plan.upserts.push(record);
+        } else {
+            for workspace in &added {
+                crate::config::validate_workspace(workspace)?;
+            }
+        }
+        plan.additions.push(ShareAddition {
+            share: share.name.clone(),
+            workspaces: added,
+        });
+    }
+    Ok(plan)
+}
+
+fn refresh_shares(
+    network_id: &str,
+    device_name: &str,
+    shares: &[ShareConfig],
+    authority: &RemoteAuthority,
+) -> Result<Vec<ShareAddition>> {
+    let records = authority.shares()?;
+    let plan = plan_share_refresh(
+        network_id,
+        device_name,
+        shares,
+        &records,
+        crate::config::discover,
+    )?;
+    for record in plan.upserts {
+        authority.upsert_share(record)?;
+    }
+    Ok(plan.additions)
+}
+
 struct DeviceSchedule {
     classifier: Classifier,
     dirty_at: Option<Instant>,
@@ -311,22 +430,45 @@ struct DeviceSchedule {
     next_full_scan: Instant,
 }
 
+impl DeviceSchedule {
+    fn starting(
+        workspace: &DeviceWorkspace,
+        now: Instant,
+        index: usize,
+        total: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            classifier: Classifier::load(&workspace.path)?,
+            dirty_at: None,
+            initial_due: Some(now + Duration::from_millis(index as u64 * 100)),
+            retry: None,
+            queued: false,
+            next_poll: now + DEVICE_POLL_INTERVAL + spread(DEVICE_POLL_INTERVAL, index, total),
+            next_full_scan: now
+                + DEVICE_FULL_SCAN_INTERVAL
+                + spread(DEVICE_FULL_SCAN_INTERVAL, index, total),
+        })
+    }
+}
+
 /// Supervise every joined repository with one filesystem watcher and a fixed
-/// worker pool. The process and thread count stay constant as folders grow.
-pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBool>) -> Result<()> {
-    let workspaces = Arc::new(
-        config
-            .shares
-            .iter()
-            .flat_map(|share| {
-                share.workspaces.iter().map(|workspace| DeviceWorkspace {
-                    label: format!("{}/{}", share.name, workspace.name),
-                    path: config.workspace_path(share, workspace),
-                    id: workspace.id.clone(),
-                })
-            })
-            .collect::<Vec<_>>(),
-    );
+/// worker pool. The process and thread count stay constant as folders grow,
+/// and repositories that appear later are picked up without a restart.
+pub fn watch_device(
+    mut config: DeviceConfig,
+    rehydrate: bool,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut workspaces = config
+        .shares
+        .iter()
+        .flat_map(|share| {
+            share
+                .workspaces
+                .iter()
+                .map(|workspace| Arc::new(DeviceWorkspace::new(&config, share, workspace)))
+        })
+        .collect::<Vec<_>>();
     println!(
         "Pando daemon managing {} workspace(s) with one watcher and {DEVICE_SYNC_WORKERS} sync workers",
         workspaces.len()
@@ -343,10 +485,12 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = event_sender.send(event);
     })?;
-    for workspace in workspaces.iter() {
+    // Watching each shared folder as a whole also shows repositories arriving
+    // between the known workspaces.
+    for share in &config.shares {
         watcher
-            .watch(&workspace.path, RecursiveMode::Recursive)
-            .with_context(|| format!("watch {}", workspace.path.display()))?;
+            .watch(&share.path, RecursiveMode::Recursive)
+            .with_context(|| format!("watch {}", share.path.display()))?;
     }
     if let Some(parent) = global_rules.parent()
         && parent.is_dir()
@@ -358,21 +502,7 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
     let mut schedules = workspaces
         .iter()
         .enumerate()
-        .map(|(index, workspace)| {
-            Ok(DeviceSchedule {
-                classifier: Classifier::load(&workspace.path)?,
-                dirty_at: None,
-                initial_due: Some(now + Duration::from_millis(index as u64 * 100)),
-                retry: None,
-                queued: false,
-                next_poll: now
-                    + DEVICE_POLL_INTERVAL
-                    + spread(DEVICE_POLL_INTERVAL, index, workspaces.len()),
-                next_full_scan: now
-                    + DEVICE_FULL_SCAN_INTERVAL
-                    + spread(DEVICE_FULL_SCAN_INTERVAL, index, workspaces.len()),
-            })
-        })
+        .map(|(index, workspace)| DeviceSchedule::starting(workspace, now, index, workspaces.len()))
         .collect::<Result<Vec<_>>>()?;
 
     let (job_sender, job_receiver) = mpsc::channel::<DeviceJob>();
@@ -383,13 +513,14 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
     for index in 0..DEVICE_SYNC_WORKERS {
         let receiver = job_receiver.clone();
         let sender = result_sender.clone();
-        let workspaces = workspaces.clone();
         let authority = RemoteAuthority::new(
             config.authority.clone(),
             config.device_id.clone(),
             device_key.clone(),
         );
         let device_id = config.device_id.clone();
+        let network_id = config.network_id.clone();
+        let device_name = config.device_name.clone();
         let network_key = network_key.clone();
         thread::Builder::new()
             .name(format!("pando-sync-{index}"))
@@ -402,22 +533,29 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
                     let Ok(job) = job else {
                         break;
                     };
-                    let result = run_device_job(
-                        &workspaces[job.workspace],
-                        job.kind,
-                        &device_id,
-                        &authority,
-                        network_key.as_ref(),
-                        rehydrate,
-                    );
-                    if sender
-                        .send(DeviceJobResult {
-                            workspace: job.workspace,
-                            kind: job.kind,
-                            result,
-                        })
-                        .is_err()
-                    {
+                    let result =
+                        match job {
+                            DeviceJob::Sync {
+                                index,
+                                workspace,
+                                kind,
+                            } => DeviceJobResult::Sync {
+                                index,
+                                kind,
+                                result: run_device_job(
+                                    &workspace,
+                                    kind,
+                                    &device_id,
+                                    &authority,
+                                    network_key.as_ref(),
+                                    rehydrate,
+                                ),
+                            },
+                            DeviceJob::Refresh { shares } => DeviceJobResult::Refresh(
+                                refresh_shares(&network_id, &device_name, &shares, &authority),
+                            ),
+                        };
+                    if sender.send(result).is_err() {
                         break;
                     }
                 }
@@ -425,11 +563,19 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
     }
     drop(result_sender);
 
+    let mut next_refresh = Instant::now();
+    let mut refresh_dirty_at: Option<Instant> = None;
+    let mut refresh_queued = false;
     while running.load(Ordering::SeqCst) {
         match event_receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(Ok(event)) => {
-                record_device_event(&event, &workspaces, &mut schedules, &global_rules)
-            }
+            Ok(Ok(event)) => record_device_event(
+                &event,
+                &config.shares,
+                &workspaces,
+                &mut schedules,
+                &global_rules,
+                &mut refresh_dirty_at,
+            ),
             Ok(Err(error)) => eprintln!("watch error: {error}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -438,36 +584,64 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
         }
         while let Ok(event) = event_receiver.try_recv() {
             match event {
-                Ok(event) => {
-                    record_device_event(&event, &workspaces, &mut schedules, &global_rules)
-                }
+                Ok(event) => record_device_event(
+                    &event,
+                    &config.shares,
+                    &workspaces,
+                    &mut schedules,
+                    &global_rules,
+                    &mut refresh_dirty_at,
+                ),
                 Err(error) => eprintln!("watch error: {error}"),
             }
         }
         while let Ok(completed) = result_receiver.try_recv() {
-            schedules[completed.workspace].queued = false;
-            match completed.result {
-                Ok(DeviceJobOutcome::Complete) => {}
-                Ok(DeviceJobOutcome::DeferredStartupScan) => {
-                    schedules[completed.workspace].next_full_scan = Instant::now()
-                        + spread(
-                            DEVICE_STARTUP_SCAN_WINDOW,
-                            completed.workspace,
-                            workspaces.len(),
-                        );
+            match completed {
+                DeviceJobResult::Sync {
+                    index,
+                    kind,
+                    result,
+                } => {
+                    schedules[index].queued = false;
+                    match result {
+                        Ok(DeviceJobOutcome::Complete) => {}
+                        Ok(DeviceJobOutcome::DeferredStartupScan) => {
+                            schedules[index].next_full_scan = Instant::now()
+                                + spread(DEVICE_STARTUP_SCAN_WINDOW, index, workspaces.len());
+                        }
+                        Err(error) => {
+                            schedules[index].retry =
+                                Some((Instant::now() + DEVICE_RETRY_INTERVAL, kind));
+                            eprintln!("{} {:?} failed: {error:#}", workspaces[index].label, kind);
+                        }
+                    }
                 }
-                Err(error) => {
-                    schedules[completed.workspace].retry =
-                        Some((Instant::now() + DEVICE_RETRY_INTERVAL, completed.kind));
-                    eprintln!(
-                        "{} {:?} failed: {error:#}",
-                        workspaces[completed.workspace].label, completed.kind
-                    );
+                DeviceJobResult::Refresh(result) => {
+                    refresh_queued = false;
+                    match result {
+                        Ok(additions) => {
+                            adopt_additions(&mut config, additions, &mut workspaces, &mut schedules)
+                        }
+                        Err(error) => {
+                            next_refresh = Instant::now() + DEVICE_RETRY_INTERVAL;
+                            eprintln!("share refresh failed: {error:#}");
+                        }
+                    }
                 }
             }
         }
 
         let now = Instant::now();
+        let discovery_due =
+            refresh_dirty_at.is_some_and(|dirty| dirty.elapsed() >= DEVICE_DISCOVERY_QUIESCENCE);
+        if !refresh_queued && (now >= next_refresh || discovery_due) {
+            refresh_dirty_at = None;
+            refresh_queued = true;
+            next_refresh = now + DEVICE_SHARE_REFRESH_INTERVAL;
+            job_sender.send(DeviceJob::Refresh {
+                shares: config.shares.clone(),
+            })?;
+        }
         for (index, schedule) in schedules.iter_mut().enumerate() {
             if schedule.queued {
                 continue;
@@ -503,8 +677,9 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
             };
             if let Some(kind) = kind {
                 schedule.queued = true;
-                job_sender.send(DeviceJob {
-                    workspace: index,
+                job_sender.send(DeviceJob::Sync {
+                    index,
+                    workspace: workspaces[index].clone(),
                     kind,
                 })?;
             }
@@ -513,11 +688,58 @@ pub fn watch_device(config: DeviceConfig, rehydrate: bool, running: Arc<AtomicBo
     Ok(())
 }
 
+fn adopt_additions(
+    config: &mut DeviceConfig,
+    additions: Vec<ShareAddition>,
+    workspaces: &mut Vec<Arc<DeviceWorkspace>>,
+    schedules: &mut Vec<DeviceSchedule>,
+) {
+    let mut changed = false;
+    for addition in additions {
+        let Some(position) = config
+            .shares
+            .iter()
+            .position(|share| share.name == addition.share)
+        else {
+            continue;
+        };
+        for workspace in addition.workspaces {
+            if config.shares[position]
+                .workspaces
+                .iter()
+                .any(|existing| existing.id == workspace.id)
+            {
+                continue;
+            }
+            let device_workspace =
+                DeviceWorkspace::new(config, &config.shares[position], &workspace);
+            let schedule = fs::create_dir_all(&device_workspace.path)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| DeviceSchedule::starting(&device_workspace, Instant::now(), 0, 1));
+            match schedule {
+                Ok(schedule) => {
+                    println!("{}: added", device_workspace.label);
+                    schedules.push(schedule);
+                    workspaces.push(Arc::new(device_workspace));
+                    config.shares[position].workspaces.push(workspace);
+                    changed = true;
+                }
+                Err(error) => eprintln!("{}: cannot add: {error:#}", device_workspace.label),
+            }
+        }
+    }
+    if changed && let Err(error) = crate::config::save(config) {
+        eprintln!("device config save failed: {error:#}");
+    }
+}
+
 fn record_device_event(
     event: &Event,
-    workspaces: &[DeviceWorkspace],
+    shares: &[ShareConfig],
+    workspaces: &[Arc<DeviceWorkspace>],
     schedules: &mut [DeviceSchedule],
-    global_rules: &std::path::Path,
+    global_rules: &Path,
+    refresh_dirty_at: &mut Option<Instant>,
 ) {
     for (index, workspace) in workspaces.iter().enumerate() {
         let rules_changed = classification_rules_changed(event, &workspace.path, global_rules);
@@ -534,6 +756,26 @@ fn record_device_event(
             schedules[index].dirty_at = Some(Instant::now());
         }
     }
+    if event
+        .paths
+        .iter()
+        .any(|path| between_workspaces(path, shares, workspaces))
+    {
+        *refresh_dirty_at = Some(Instant::now());
+    }
+}
+
+/// A change beneath a shared folder that no workspace claims may be a new
+/// repository.
+fn between_workspaces(
+    path: &Path,
+    shares: &[ShareConfig],
+    workspaces: &[Arc<DeviceWorkspace>],
+) -> bool {
+    shares.iter().any(|share| path.starts_with(&share.path))
+        && !workspaces
+            .iter()
+            .any(|workspace| path.starts_with(&workspace.path))
 }
 
 fn run_device_job(
@@ -857,6 +1099,134 @@ mod tests {
         assert!(DEVICE_STARTUP_SCAN_WINDOW >= Duration::from_secs(10 * 60));
         assert!(DEVICE_FULL_SCAN_INTERVAL >= Duration::from_secs(6 * 60 * 60));
         assert!(DEVICE_RETRY_INTERVAL >= Duration::from_secs(30));
+    }
+
+    const NETWORK: &str = "00112233445566770011223344556677";
+
+    fn code_share(root: &Path, relatives: &[&str]) -> ShareConfig {
+        ShareConfig {
+            name: "code".into(),
+            path: root.to_owned(),
+            workspaces: relatives
+                .iter()
+                .map(|relative| {
+                    crate::config::workspace(NETWORK, "code", root, relative.into()).unwrap()
+                })
+                .collect(),
+        }
+    }
+
+    fn never_discover(_: &Path) -> Result<Vec<PathBuf>> {
+        unreachable!("discovery must not run for this share")
+    }
+
+    #[test]
+    fn hosted_folder_gains_repositories_that_appear_beneath_it() {
+        let root = Path::new("/srv/Code");
+        let share = code_share(root, &["apps/one"]);
+        let record = ShareRecord {
+            name: "code".into(),
+            host: "macbook".into(),
+            workspaces: share.workspaces.clone(),
+        };
+        let plan = plan_share_refresh(
+            NETWORK,
+            "macbook",
+            std::slice::from_ref(&share),
+            &[record],
+            |_| Ok(vec!["apps/one".into(), "apps/two".into()]),
+        )
+        .unwrap();
+
+        let two = crate::config::workspace(NETWORK, "code", root, "apps/two".into()).unwrap();
+        assert_eq!(
+            plan.additions,
+            vec![ShareAddition {
+                share: "code".into(),
+                workspaces: vec![two.clone()],
+            }]
+        );
+        assert_eq!(plan.upserts.len(), 1);
+        assert_eq!(plan.upserts[0].host, "macbook");
+        assert_eq!(
+            plan.upserts[0].workspaces,
+            vec![share.workspaces[0].clone(), two]
+        );
+    }
+
+    #[test]
+    fn joined_folder_adopts_workspaces_the_host_registered() {
+        let root = Path::new("/srv/Code");
+        let share = code_share(root, &["apps/one"]);
+        let hosted = code_share(root, &["apps/one", "apps/two"]);
+        let record = ShareRecord {
+            name: "code".into(),
+            host: "macbook".into(),
+            workspaces: hosted.workspaces.clone(),
+        };
+        let plan =
+            plan_share_refresh(NETWORK, "devbox", &[share], &[record], never_discover).unwrap();
+
+        assert_eq!(
+            plan.additions,
+            vec![ShareAddition {
+                share: "code".into(),
+                workspaces: vec![hosted.workspaces[1].clone()],
+            }]
+        );
+        assert!(plan.upserts.is_empty());
+    }
+
+    #[test]
+    fn unchanged_single_repository_and_unregistered_folders_are_left_alone() {
+        let root = Path::new("/srv/Code");
+        let single = code_share(root, &["."]);
+        let record = ShareRecord {
+            name: "code".into(),
+            host: "macbook".into(),
+            workspaces: single.workspaces.clone(),
+        };
+        let plan =
+            plan_share_refresh(NETWORK, "macbook", &[single], &[record], never_discover).unwrap();
+        assert!(plan.additions.is_empty() && plan.upserts.is_empty());
+
+        let unregistered = code_share(root, &["apps/one"]);
+        let plan =
+            plan_share_refresh(NETWORK, "macbook", &[unregistered], &[], never_discover).unwrap();
+        assert!(plan.additions.is_empty() && plan.upserts.is_empty());
+    }
+
+    #[test]
+    fn only_paths_outside_every_workspace_trigger_discovery() {
+        let root = Path::new("/srv/Code");
+        let share = code_share(root, &["apps/one"]);
+        let config = DeviceConfig::new(
+            NETWORK.into(),
+            "88990011223344558899001122334455".into(),
+            "macbook".into(),
+            "127.0.0.1:7337".into(),
+        );
+        let workspaces = vec![Arc::new(DeviceWorkspace::new(
+            &config,
+            &share,
+            &share.workspaces[0],
+        ))];
+        let shares = [share];
+        assert!(between_workspaces(
+            Path::new("/srv/Code/apps/two/.git"),
+            &shares,
+            &workspaces
+        ));
+        assert!(!between_workspaces(
+            Path::new("/srv/Code/apps/one/src/main.rs"),
+            &shares,
+            &workspaces
+        ));
+        assert!(!between_workspaces(
+            Path::new("/home/me/.config/pando/ignore"),
+            &shares,
+            &workspaces
+        ));
     }
 
     #[test]

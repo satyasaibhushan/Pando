@@ -43,6 +43,8 @@ pando join code            # lands in ~/Pando/code, or pass a path
 
 `share` and `join` return after the folder is configured and the device daemon is ready. Initial transfer continues in the background, with at most two repositories scanning or transferring at once so onboarding cannot overwhelm the machine. Background services run with reduced CPU and I/O priority; systemd also caps Pando at half a CPU and starts reclaim pressure above 512 MB. `pando status` reports `waiting for initial sync`, `syncing`, `in sync`, or `needs decision` for each repository. Pass `--no-services` when you deliberately want the command to perform the complete initial transfer in the foreground.
 
+The daemon keeps discovering. A repository that appears later under a hosted folder is registered within seconds of it settling (or on the next minute-wise check), and every device that joined the folder creates and syncs it automatically; no re-share or re-join needed. Removing a repository from a folder still takes an explicit `pando share`.
+
 Enrollment mints per-device credentials over an encrypted channel — nothing secret is copied between machines by hand, and `pando revoke <device>` expels a machine instantly. Existing disjoint files and subfolders are unioned on first join. If the same path differs, neither side is overwritten: Pando preserves the joining device as a pending version for an explicit decision in the TUI.
 
 Day-to-day commands:

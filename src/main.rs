@@ -907,7 +907,11 @@ fn authority_bind(config: &DeviceConfig) -> Result<String> {
 }
 
 fn hosts_authority(config: &DeviceConfig) -> bool {
-    config.authority.starts_with("127.0.0.1:") || config.authority.starts_with("localhost:")
+    let local_address =
+        config.authority.starts_with("127.0.0.1:") || config.authority.starts_with("localhost:");
+    local_address
+        && pando::config::authority_data_path()
+            .is_ok_and(|data| data.join("registry.json").exists())
 }
 
 fn remote(config: &DeviceConfig) -> Result<RemoteAuthority> {

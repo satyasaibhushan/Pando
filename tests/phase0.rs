@@ -1087,6 +1087,142 @@ fn cli_onboarding_flows_from_up_to_a_joined_folder() {
     ));
 }
 
+fn spawn_pando(data_home: &Path, args: &[&str]) -> KillOnDrop {
+    KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pando"))
+            .env("PANDO_DATA_HOME", data_home)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    for _ in 0..600 {
+        if condition() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn enroll(authority_home: &Path, device_home: &Path, name: &str, address: &str) {
+    let invite = pando(authority_home, &["invite"]);
+    let code = invite
+        .split_whitespace()
+        .skip_while(|word| *word != "--code")
+        .nth(1)
+        .expect("invite output contains a code");
+    pando(
+        device_home,
+        &[
+            "up",
+            "--no-services",
+            "--name",
+            name,
+            "--to",
+            address,
+            "--code",
+            code,
+        ],
+    );
+}
+
+fn committed_repository(path: &Path, file: &str, content: &str) {
+    fs::create_dir_all(path).unwrap();
+    git(path, &["init", "-b", "main"]);
+    git(path, &["config", "user.email", "pando@example.test"]);
+    git(path, &["config", "user.name", "Pando Test"]);
+    fs::write(path.join(file), content).unwrap();
+    git(path, &["add", file]);
+    git(path, &["commit", "-m", "base"]);
+}
+
+#[test]
+fn daemon_adds_repositories_that_appear_after_sharing() {
+    let root = tempfile::tempdir().unwrap();
+    let authority_home = root.path().join("authority-state");
+    let host_home = root.path().join("host-state");
+    let guest_home = root.path().join("guest-state");
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let address = format!("127.0.0.1:{port}");
+    pando(
+        &authority_home,
+        &[
+            "up",
+            "--no-services",
+            "--name",
+            "authority",
+            "--bind",
+            &address,
+        ],
+    );
+    let _serve = spawn_pando(&authority_home, &["serve", "--bind", &address]);
+    wait_until("authority to listen", || {
+        std::net::TcpStream::connect(&address).is_ok()
+    });
+    enroll(&authority_home, &host_home, "macbook", &address);
+    enroll(&authority_home, &guest_home, "linuxbox", &address);
+
+    let folder = root.path().join("code");
+    committed_repository(&folder.join("first"), "work.txt", "first\n");
+    pando(
+        &host_home,
+        &["share", folder.to_str().unwrap(), "--no-services"],
+    );
+    let landing = root.path().join("guest-code");
+    pando(
+        &guest_home,
+        &["join", "code", landing.to_str().unwrap(), "--no-services"],
+    );
+    assert_eq!(
+        fs::read_to_string(landing.join("first/work.txt")).unwrap(),
+        "first\n"
+    );
+
+    // The host daemon is already running when a second repository lands in
+    // the shared folder.
+    let _host_daemon = spawn_pando(&host_home, &["daemon"]);
+    std::thread::sleep(Duration::from_secs(3));
+    committed_repository(&folder.join("second"), "note.txt", "second\n");
+
+    wait_until("host to register the new repository", || {
+        fs::read_to_string(host_home.join("device.json"))
+            .is_ok_and(|config| config.contains("\"second\""))
+    });
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(host_home.join("device.json")).unwrap()).unwrap();
+    let workspace_id = config["shares"][0]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|workspace| workspace["name"] == "second")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let authority = FileAuthority::open(authority_home.join("authority")).unwrap();
+    wait_until("host to publish the new repository", || {
+        authority.head(&workspace_id).ok().flatten().is_some()
+    });
+
+    // A joined device learns about it from the authority and syncs it down.
+    let _guest_daemon = spawn_pando(&guest_home, &["daemon"]);
+    wait_until("guest to receive the new repository", || {
+        fs::read_to_string(landing.join("second/note.txt")).is_ok_and(|note| note == "second\n")
+    });
+    assert!(
+        fs::read_to_string(guest_home.join("device.json"))
+            .unwrap()
+            .contains("\"second\"")
+    );
+}
+
 #[test]
 fn deletions_propagate_and_unchanged_trees_do_not_make_snapshots() {
     let harness = Harness::plain();
