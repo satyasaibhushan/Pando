@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pando · your working tree, on every device</title>
+<meta name="description" content="Pando carries uncommitted work between your machines over an encrypted device transport. Git stays the history; Pando supplies presence.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Fragment+Mono&family=Figtree:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #f3efe4;
+    --ink: #1d2a22;
+    --soft: #5d6b60;
+    --rule: #d8d1bf;
+    --leaf: #c99a2e;
+    --bark: #2f4a3a;
+    --term: #171b22;
+    --serif: "Fraunces", Georgia, serif;
+    --mono: "Fragment Mono", ui-monospace, monospace;
+    --sans: "Figtree", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    font: 17px/1.65 var(--sans);
+    background:
+      repeating-linear-gradient(90deg, transparent 0 46px, #e9e3d4 46px 47px, transparent 47px 140px),
+      var(--paper);
+  }
+  a { color: var(--bark); }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 28px 96px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 28px 0; border-bottom: 1px solid var(--rule); }
+  .brand { font: 600 24px var(--serif); letter-spacing: -0.01em; }
+  .brand span { color: var(--leaf); }
+  header a { font: 13px var(--mono); text-decoration: none; }
+  .hero { display: grid; grid-template-columns: 1.15fr 1fr; gap: 48px; align-items: end; padding: 64px 0 0; }
+  .tag { font: 12px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--leaf); }
+  h1 { font: 400 clamp(44px, 6.2vw, 80px)/1.0 var(--serif); letter-spacing: -0.03em; margin: 16px 0 0; }
+  h1 em { font-style: italic; color: var(--bark); }
+  .lede { color: var(--soft); max-width: 46ch; margin: 0; }
+  .lede strong { color: var(--ink); font-weight: 500; }
+  .badge { display: inline-block; margin-top: 18px; font: 12px var(--mono); border: 1px solid var(--leaf); color: #8a6516; padding: 4px 10px; border-radius: 99px; }
+  figure { margin: 56px 0 0; position: relative; }
+  .frame {
+    background: var(--term);
+    border-radius: 14px;
+    padding: 34px 6px 6px;
+    position: relative;
+    box-shadow: 0 2px 0 var(--rule), 0 50px 90px -50px #1d2a2299;
+    animation: grow 0.9s cubic-bezier(.2,.7,.2,1) both 0.1s;
+  }
+  .frame::before {
+    content: "studio  ⇄  laptop";
+    position: absolute; top: 9px; left: 0; right: 0; text-align: center;
+    font: 12px var(--mono); color: #7d8796;
+  }
+  .frame::after {
+    content: ""; position: absolute; top: 13px; left: 16px; width: 9px; height: 9px; border-radius: 50%;
+    background: #e5675a; box-shadow: 16px 0 #e5b45a, 32px 0 #5fbf74;
+  }
+  video { display: block; width: 100%; height: auto; border-radius: 9px; }
+  figcaption { font: 12px var(--mono); color: var(--soft); margin-top: 12px; }
+  .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 36px; margin-top: 76px; padding-top: 30px; border-top: 1px solid var(--rule); }
+  .cols h3 { font: 600 22px/1.2 var(--serif); margin: 0 0 8px; }
+  .cols p { margin: 0; color: var(--soft); font-size: 15.5px; }
+  .start { margin-top: 76px; display: grid; grid-template-columns: 1fr 1.25fr; gap: 40px; }
+  .start h2 { font: 400 36px/1.1 var(--serif); margin: 0 0 12px; }
+  .start p { color: var(--soft); margin: 0 0 12px; }
+  pre { margin: 0; background: var(--term); color: #dfe6ee; font: 13.5px/1.75 var(--mono); padding: 20px 22px; border-radius: 12px; overflow-x: auto; }
+  pre .c { color: #7d8796; }
+  footer { margin-top: 80px; padding-top: 20px; border-top: 1px solid var(--rule); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; font: 12px var(--mono); color: var(--soft); }
+  @keyframes grow { from { opacity: 0; transform: translateY(24px) scale(0.985); } }
+  @media (max-width: 860px) { .hero, .cols, .start { grid-template-columns: 1fr; } }
+  @media (prefers-reduced-motion: reduce) { .frame { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="brand">pando<span>.</span></span>
+    <a href="https://github.com/satyasaibhushan/Pando">GitHub →</a>
+  </header>
+
+  <section class="hero">
+    <div>
+      <div class="tag">One root system, many trunks</div>
+      <h1>Your working tree, on <em>every</em> device.</h1>
+    </div>
+    <div>
+      <p class="lede">Git keeps the history. Pando carries everything since the last push: <strong>modified files, untracked secrets, the index, stashes</strong>, between your machines over an encrypted device transport. When the same path changed on both, it asks you instead of picking a winner.</p>
+      <span class="badge">Unreleased · real-machine testing is the release gate</span>
+    </div>
+  </section>
+
+  <figure>
+    <div class="frame">
+      <video autoplay muted loop playsinline poster="demo/poster.png" aria-label="Studio shares a folder with an uncommitted edit; laptop joins and its git status shows the same changes, then opens the Pando dashboard">
+        <source src="demo/demo.webm" type="video/webm">
+        <source src="demo/demo.mp4" type="video/mp4">
+      </video>
+    </div>
+    <figcaption>A real run of the release binary in two containers named studio and laptop. Every command shown ran as typed; the daemon start a service install would do happens off screen.</figcaption>
+  </figure>
+
+  <section class="cols">
+    <div>
+      <h3>Device first</h3>
+      <p>A machine joins the network once with a single-use code that expires in 15 minutes, then picks which hosted folders it carries. <code>pando revoke</code> removes a device at once.</p>
+    </div>
+    <div>
+      <h3>Never a silent merge</h3>
+      <p>If a path differs on both sides, neither is overwritten. The dashboard offers the network version, this device's, both copies, your editor, or a manual resolution.</p>
+    </div>
+    <div>
+      <h3>Quiet while idle</h3>
+      <p>One daemon per device, at most two repositories transferring at once, reduced CPU and I/O priority, and remote checks spread across each minute.</p>
+    </div>
+  </section>
+
+  <section class="start">
+    <div>
+      <h2>Try it</h2>
+      <p>Build the binary on each machine and allow TCP 7337 to the first one. There are no packaged releases yet.</p>
+    </div>
+<pre><span class="c"># first machine</span>
+pando up
+pando share ~/Code --name code
+pando invite
+
+<span class="c"># every other machine</span>
+pando up --to HOST_IP:7337 --code xxxxx-xxxxx
+pando join code
+pando              <span class="c"># dashboard</span></pre>
+  </section>
+
+  <footer>
+    <span>Pando · Rust, Noise NNpsk0, ChaCha20-Poly1305, ratatui · MIT</span>
+    <a href="https://github.com/satyasaibhushan/Pando">github.com/satyasaibhushan/Pando</a>
+  </footer>
+</div>
+</body>
+</html>

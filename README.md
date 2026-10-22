@@ -2,6 +2,12 @@
 
 Pando carries the state between your keyboard and the last push to every machine you use. Git remains history; Pando supplies presence.
 
+[![Two machines: studio shares a folder with uncommitted work, laptop joins and gets the same dirty files, then opens the dashboard](docs/demo/poster.png)](docs/demo/demo.mp4)
+
+A real run of the release binary in two Docker containers standing in for two machines ([mp4](docs/demo/demo.mp4), [webm](docs/demo/demo.webm)). Studio has an uncommitted edit and an untracked `.env`; after `pando join`, the laptop's checkout shows the same `git status`. [`docs/index.html`](docs/index.html) is the product page built around it.
+
+I built Pando to move uncommitted work between my machines.
+
 Phase 0 proved the two-machine handoff. The Phase 1 implementation now has device-first onboarding with one-time enrollment codes, per-device encrypted transport, background watchers, Git-aware working-tree capture, safe first-join merging, and interactive conflict resolution. Real-machine dogfooding remains the release gate.
 
 ## Build and test
@@ -16,6 +22,26 @@ Run the deterministic local handoff demo:
 ```sh
 cargo run -- demo
 ```
+
+## Stack
+
+Rust 2024 as a single binary: clap for the CLI, ratatui and crossterm for the dashboard, Noise `NNpsk0` (snow) with ChaCha20-Poly1305 for transport, BLAKE3 content addressing, and `notify` for filesystem events. Git stays the history; Pando reads and writes `.git` state directly.
+
+## Demo
+
+`docs/demo/record.py` starts two containers named `studio` and `laptop` on a private Docker network, mounts `target/release/pando`, and runs every command shown in the recording for real. It writes an asciicast; `render.sh` turns it into `poster.png`, `demo.webm` and `demo.mp4` with [agg](https://github.com/asciinema/agg) and ffmpeg (libvpx-vp9 and libx264).
+
+```sh
+cargo build --release
+python3 docs/demo/record.py
+docs/demo/render.sh            # AGG=/path/to/agg FFMPEG=/path/to/ffmpeg if not on PATH
+```
+
+The containers have no systemd, so the recording passes `--no-services` and starts `pando daemon` on studio between `up` and `share`, which the service install would do. The containers and network are removed afterwards. The build needs a glibc no newer than the container image's (default `rust:1`).
+
+## Status
+
+Unreleased. Real-machine dogfooding is the release gate. The recording covers onboarding and the initial transfer. Continuous background sync between the two containers did not converge in my runs: the laptop daemon refused pulls with `dirty local head` while studio held the lease, so the recording does not claim it.
 
 ## Getting started
 
